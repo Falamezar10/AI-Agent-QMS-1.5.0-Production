@@ -611,7 +611,11 @@ def read_local_file(filename):
         return f"Ошибка: Файл '{filename}' не найден в разрешенных директориях."
 
     if os.path.isdir(target_file):
-        files = [f for f in os.listdir(target_file) if f.endswith(('.docx', '.txt', '.md'))]
+        allowed_exts = (
+            '.docx', '.txt', '.md', '.pdf', '.png', '.jpg', '.jpeg',
+            '.xlsx', '.xls', '.doc', '.rtf', '.graphml', '.html'
+        )
+        files = [f for f in os.listdir(target_file) if f.lower().endswith(allowed_exts)]
         return f"ОШИБКА: '{filename}' - это папка. Доступные файлы внутри: {', '.join(files)}. Вызови этот инструмент заново для каждого файла по отдельности."
 
     # 4. Читаем сам файл
@@ -1898,10 +1902,11 @@ def save_global_settings(data):
 # ==================== GUI ПРИЛОЖЕНИЕ ====================
 
 APP_NAME = "ИИ-Агент СМК"
-APP_VERSION = "v1.5.0 Enterprise"
+APP_VERSION = "v1.5.1 Enterprise"
 APP_DEVELOPER = "Плаксунов В.Б."
 APP_PHONE = "2166"
 APP_DESCRIPTION = (
+    "1.5.1 - Исправлено слепота в папках"
     "Корпоративный ИИ-ассистент для Системы Менеджмента Качества (СМК).\n"
     "Приложение помогает анализировать документы, выполнять аудит,\n"
     "искать информацию по базе знаний и формировать рабочие материалы.\n"
