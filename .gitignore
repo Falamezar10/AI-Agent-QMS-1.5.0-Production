@@ -17,7 +17,10 @@ dist/
 *.spec
 *.exe
 *.zip
-*.bat
+# BAT файлы - разрешаем только служебные
+!start.bat
+!build_agent.bat
+!Установить Агента СМК на ПК.bat
 SMK_Docs/
 plans/
 .kilocode/
