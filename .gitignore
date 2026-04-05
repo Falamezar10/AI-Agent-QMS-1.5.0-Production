@@ -21,7 +21,10 @@ dist/
 !start.bat
 !build_agent.bat
 !Установить Агента СМК на ПК.bat
+!Деплой на сервер.bat
 SMK_Docs/
 plans/
 .kilocode/
 .kilocodemodes
+.roo/
+.roomodes
