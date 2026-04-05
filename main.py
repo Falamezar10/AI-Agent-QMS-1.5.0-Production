@@ -35,6 +35,7 @@ from tkinter import filedialog
 import shutil
 import tempfile
 import requests
+import subprocess
 import wikipedia
 import queue
 import webbrowser
@@ -123,6 +124,7 @@ def get_vault_data():
     """Чтение зашифрованного Vault с fallback на переменные окружения."""
     default_vault = {
         "openrouter_key": os.getenv("OPENROUTER_API_KEY", "").strip(),
+        "groq_key": "",
         "tavily_key": "",
         "admin_password": "admin"
     }
@@ -138,6 +140,7 @@ def get_vault_data():
             return default_vault
         return {
             "openrouter_key": str(data.get("openrouter_key", default_vault["openrouter_key"])).strip(),
+            "groq_key": str(data.get("groq_key", "")).strip(),
             "tavily_key": str(data.get("tavily_key", "")).strip(),
             "admin_password": str(data.get("admin_password", "admin")).strip() or "admin"
         }
@@ -149,6 +152,7 @@ def save_vault_data(data):
     try:
         payload = {
             "openrouter_key": str(data.get("openrouter_key", "")).strip(),
+            "groq_key": str(data.get("groq_key", "")).strip(),
             "tavily_key": str(data.get("tavily_key", "")).strip(),
             "admin_password": str(data.get("admin_password", "admin")).strip() or "admin"
         }
@@ -533,6 +537,129 @@ def extract_text_from_html_diagram(filepath):
     except Exception as e:
         return f"Ошибка парсинга HTML-диаграммы: {str(e)}"
 
+def transcribe_audio_logic(filename, app_instance):
+    target_file = find_target_file(filename)
+    if not target_file:
+        return f"Ошибка: Аудиофайл '{filename}' не найден."
+
+    def log_progress(msg):
+        if app_instance is not None:
+            # Убран тег "agent_msg", чтобы не было серого фона
+            app_instance.after(0, lambda: app_instance.append_to_chat(f"  [Система: 🎙️ {msg}]\n"))
+
+    temp_dir = None
+    try:
+        log_progress(f"Старт транскрибации: {os.path.basename(target_file)}")
+
+        global_settings = load_global_settings()
+        local_settings = load_local_settings()
+        vault = get_vault_data()
+
+        provider = global_settings.get("audio_provider", "OpenRouter")
+        model = global_settings.get("audio_model", "openai/gpt-4o-audio-preview")
+        chunk_mins = int(global_settings.get("audio_chunk_mins", 60))
+        overlap_secs = int(global_settings.get("audio_overlap_secs", 15))
+
+        proxies = None
+        if local_settings.get("use_proxy", False):
+            host = local_settings.get("proxy_host", "127.0.0.1")
+            port = local_settings.get("proxy_port", "2080")
+            proxies = {"http": f"socks5://{host}:{port}", "https": f"socks5://{host}:{port}"}
+
+        # 1. Длина аудио
+        probe_cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", target_file]
+        probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, encoding='utf-8')
+        duration_secs = float(json.loads(probe_result.stdout)['format']['duration'])
+        log_progress(f"Длительность: {int(duration_secs)} сек. Нарезка на куски...")
+
+        # 2. Нарезка
+        temp_dir = os.path.join(os.path.dirname(target_file), ".temp_audio")
+        os.makedirs(temp_dir, exist_ok=True)
+        chunks_paths = []
+        start_time = 0.0
+        chunk_len_sec = chunk_mins * 60
+
+        while start_time < duration_secs:
+            out_path = os.path.join(temp_dir, f"chunk_{len(chunks_paths)}.mp3")
+            ffmpeg_cmd = ["ffmpeg", "-y", "-i", target_file, "-ss", str(start_time), "-t", str(chunk_len_sec), "-c:a", "libmp3lame", "-b:a", "64k", out_path]
+            subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if os.path.exists(out_path):
+                chunks_paths.append(out_path)
+            start_time += (chunk_len_sec - overlap_secs)
+            if chunk_len_sec <= overlap_secs:
+                start_time += chunk_len_sec
+
+        log_progress(f"Подготовлено кусков: {len(chunks_paths)}. Отправка в {provider}/{model}...")
+
+        full_transcription = []
+        # 3. Отправка
+        for i, chunk_path in enumerate(chunks_paths):
+            log_progress(f"Отправка куска {i + 1}/{len(chunks_paths)}")
+            if provider == "Groq":
+                api_key = vault.get("groq_key", "")
+                if not api_key:
+                    raise ValueError("Не настроен Groq API Key")
+                url = "https://api.groq.com/openai/v1/audio/transcriptions"
+                with open(chunk_path, "rb") as f:
+                    files = {"file": (os.path.basename(chunk_path), f, "audio/mpeg")}
+                    data = {"model": model, "temperature": "0.1", "response_format": "text", "language": "ru"}
+                    resp = requests.post(url, headers={"Authorization": f"Bearer {api_key}"}, files=files, data=data, proxies=proxies)
+                if resp.status_code == 200:
+                    full_transcription.append(resp.text.strip())
+                else:
+                    raise ValueError(f"Ошибка Groq: {resp.text}")
+            else:
+                api_key = vault.get("openrouter_key", "") or os.getenv("OPENROUTER_API_KEY", "")
+                with open(chunk_path, "rb") as f:
+                    b64_audio = base64.b64encode(f.read()).decode('utf-8')
+                prompt = "Ты профессиональный стенографист. Твоя задача - дословная расшифровка аудио.\nПРАВИЛА:\n1. Выведи ТОЛЬКО текст, который произносят люди.\n2. НИКАКИХ своих комментариев.\n3. ТРАНСКРИБИРУЙ ВЕСЬ КУСОК ДО САМОГО КОНЦА, пиши всё, что слышишь."
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "input_audio", "input_audio": {"data": b64_audio, "format": "mp3"}}]}],
+                    "temperature": 0.1,
+                    "frequency_penalty": 0.5
+                }
+                resp = requests.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers={"Authorization": f"Bearer {api_key}"}, proxies=proxies)
+                if resp.status_code == 200:
+                    full_transcription.append(resp.json().get('choices', [{}])[0].get('message', {}).get('content', ''))
+                else:
+                    raise ValueError(f"Ошибка OpenRouter: {resp.text}")
+
+        log_progress("Сборка финальной транскрипции...")
+        final_text = "\n\n".join(full_transcription)
+
+        # 4. Сохранение
+        base_dir = os.path.dirname(target_file)
+        name_without_ext = os.path.splitext(os.path.basename(target_file))[0]
+        abs_path = os.path.abspath(target_file)
+
+        # Кэш
+        cache_dir = os.path.join(get_base_path(), ".cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        path_hash = hashlib.md5(abs_path.encode("utf-8")).hexdigest()[:6]
+        with open(os.path.join(cache_dir, f"{name_without_ext}_{path_hash}_audio.md"), "w", encoding="utf-8") as f:
+            f.write(final_text)
+
+        # Docx
+        docx_path = os.path.join(base_dir, f"ТРАНСКРИПЦИЯ_{name_without_ext}.docx")
+        doc = Document()
+        doc.add_paragraph(f"Расшифровка аудио: {os.path.basename(target_file)}").style = 'Heading 1'
+        doc.add_paragraph(f"Дата генерации: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n---")
+        for p_text in final_text.split("\n\n"):
+            if p_text.strip():
+                doc.add_paragraph(p_text.strip())
+        doc.save(docx_path)
+        log_progress(f"Завершено. Создан документ: {os.path.basename(docx_path)}")
+
+        threading.Thread(target=sync_vector_db, daemon=True).start()
+        return f"Аудиофайл успешно расшифрован! Создан документ: [Из файла: {os.path.basename(docx_path)}]"
+    except Exception as e:
+        log_progress(f"Ошибка: {str(e)}")
+        return f"Ошибка транскрибации: {str(e)}"
+    finally:
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
 def convert_legacy_to_docx(input_path, output_path):
     """Конвертирует .doc/.rtf в .docx через скрытый COM-объект Word"""
     pythoncom.CoInitialize()
@@ -613,7 +740,8 @@ def read_local_file(filename):
     if os.path.isdir(target_file):
         allowed_exts = (
             '.docx', '.txt', '.md', '.pdf', '.png', '.jpg', '.jpeg',
-            '.xlsx', '.xls', '.doc', '.rtf', '.graphml', '.html'
+            '.xlsx', '.xls', '.doc', '.rtf', '.graphml', '.html',
+            '.mp3', '.wav', '.m4a', '.ogg'
         )
         files = [f for f in os.listdir(target_file) if f.lower().endswith(allowed_exts)]
         return f"ОШИБКА: '{filename}' - это папка. Доступные файлы внутри: {', '.join(files)}. Вызови этот инструмент заново для каждого файла по отдельности."
@@ -651,6 +779,19 @@ def read_local_file(filename):
             return extract_text_from_graphml(target_file)
         elif ext.endswith('.html'):
             return extract_text_from_html_diagram(target_file)
+        elif ext.endswith(('.mp3', '.wav', '.m4a', '.ogg')):
+            # Используем АБСОЛЮТНЫЙ путь для 100% совпадения хэшей
+            abs_path = os.path.abspath(target_file)
+            path_hash = hashlib.md5(abs_path.encode('utf-8')).hexdigest()[:6]
+            name_without_ext = os.path.splitext(os.path.basename(target_file))[0]
+            
+            cache_path = os.path.join(get_base_path(), ".cache", f"{name_without_ext}_{path_hash}_audio.md")
+
+            if os.path.exists(cache_path):
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    return f"--- РАСШИФРОВКА АУДИО ({os.path.basename(target_file)}) ---\n{f.read()}"
+            
+            return f"[Системная метка: Аудиофайл '{os.path.basename(target_file)}'. Текст еще НЕ расшифрован. Спроси у пользователя разрешение и вызови инструмент 'transcribe_audio_file'.]"
         else:
             return "Ошибка: Поддерживаются только форматы .txt, .md, .docx, .doc, .rtf, .pdf, .png, .jpg, .jpeg, .xlsx, .xls, .graphml, .html"
     except Exception as e: return f"Ошибка чтения файла: {str(e)}"
@@ -667,7 +808,7 @@ def chunk_text(text, chunk_size=350, overlap=50):
 def scan_folders_for_docs(folders):
     settings = load_global_settings()
     excludes = [k.lower() for k in settings.get("exclude_keywords", [])]
-    allowed_exts = ('.docx', '.txt', '.md', '.pdf', '.png', '.jpg', '.jpeg', '.xlsx', '.xls', '.doc', '.rtf', '.graphml', '.html')
+    allowed_exts = ('.docx', '.txt', '.md', '.pdf', '.png', '.jpg', '.jpeg', '.xlsx', '.xls', '.doc', '.rtf', '.graphml', '.html', '.mp3', '.wav', '.m4a', '.ogg')
 
     def has_excluded(text):
         text_low = str(text).lower()
@@ -716,6 +857,85 @@ def save_file_states(states):
         with open(file_states_path, 'w', encoding='utf-8') as f: json.dump(states, f, ensure_ascii=False, indent=2)
     except: pass
 
+def list_available_files(category="all", search_keyword=""):
+    """Инструмент: Умный поиск и группировка проиндексированных файлов из file_states.json"""
+    try:
+        states = get_file_states()
+        if not states:
+            return "База файлов пуста. Подскажи пользователю нажать 'Синхронизировать базу'."
+            
+        ext_map = {
+            "audio": ('.mp3', '.wav', '.m4a', '.ogg'),
+            "excel": ('.xlsx', '.xls'),
+            "word": ('.docx', '.doc', '.rtf'),
+            "pdf": ('.pdf',),
+            "image": ('.png', '.jpg', '.jpeg'),
+            "text": ('.txt', '.md'),
+            "diagram": ('.graphml', '.html')
+        }
+
+        labels = {
+            "audio": "🎙️ Аудиофайлы",
+            "excel": "📊 Таблицы Excel",
+            "word": "📄 Word Документы",
+            "pdf": "📕 PDF Документы",
+            "image": "🖼️ Изображения",
+            "text": "📝 Текстовые файлы",
+            "diagram": "📈 Схемы и Диаграммы"
+        }
+        
+        grouped_files = {k: [] for k in ext_map.keys()}
+        grouped_files["other"] = []
+        labels["other"] = "📁 Другие файлы"
+
+        keyword = str(search_keyword).lower().strip()
+        total_found = 0
+        
+        for path in states.keys():
+            ext = os.path.splitext(path)[1].lower()
+            name = os.path.basename(path)
+            
+            # Фильтр по ключевому слову в названии
+            if keyword and keyword not in name.lower():
+                continue
+                
+            # Определяем категорию
+            matched_cat = "other"
+            for cat, exts in ext_map.items():
+                if ext in exts:
+                    matched_cat = cat
+                    break
+                    
+            # Фильтр по категории (если запрошена конкретная)
+            if category != "all" and matched_cat != category:
+                continue
+                
+            grouped_files[matched_cat].append(name)
+            total_found += 1
+            
+        if total_found == 0:
+            msg = "В базе не найдено файлов."
+            if category != "all": msg += f" Категория: '{category}'."
+            if keyword: msg += f" Искомое слово: '{keyword}'."
+            return msg
+            
+        output_lines = [f"НАЙДЕНО ФАЙЛОВ ({total_found} шт):"]
+        
+        # Собираем красивый структурированный список для Агента
+        for cat, files in grouped_files.items():
+            if files:
+                output_lines.append(f"\n{labels[cat]}:")
+                unique_files = sorted(list(set(files)))
+                # Ограничиваем вывод одной категории 30 файлами, чтобы не взорвать контекст
+                for f in unique_files[:30]:
+                    output_lines.append(f"  - {f}")
+                if len(unique_files) > 30:
+                    output_lines.append(f"  ... и еще {len(unique_files) - 30} файлов этой категории.")
+                    
+        return "\n".join(output_lines)
+    except Exception as e:
+        return f"Ошибка при получении списка файлов: {str(e)}"
+
 def sync_vector_db(self=None):
     try:
         # --- ПРЕДОХРАНИТЕЛЬ: Проверяем наличие реального ключа ---
@@ -747,13 +967,32 @@ def sync_vector_db(self=None):
         file_states = get_file_states()
         found_files = scan_folders_for_docs(folders_to_scan)
         
+        # ВОССТАНОВЛЕННЫЕ ПЕРЕМЕННЫЕ
         new_file_states = {}
         files_to_reindex = []
-        
+        untranscribed_audio = [] # Список для оповещений
+
         for file_path in found_files:
             filename = os.path.basename(file_path)
             mtime = str(os.path.getmtime(file_path))
             new_file_states[file_path] = mtime
+            
+            # --- ЗАЩИТА ОТ ДУБЛИРОВАНИЯ И ПРОВЕРКА КЭША ---
+            if file_path.lower().endswith(('.mp3', '.wav', '.m4a', '.ogg')):
+                abs_path = os.path.abspath(file_path)
+                path_hash = hashlib.md5(abs_path.encode('utf-8')).hexdigest()[:6]
+                name_without_ext = os.path.splitext(filename)[0]
+                c_path = os.path.join(get_base_path(), ".cache", f"{name_without_ext}_{path_hash}_audio.md")
+                
+                # Если кэша нет - добавляем в список неопознанных
+                if not os.path.exists(c_path):
+                    untranscribed_audio.append(filename)
+                
+                # КРИТИЧЕСКИ ВАЖНО: Пропускаем добавление аудио в files_to_reindex,
+                # чтобы Chroma DB не засорялась текстом из кэша (для этого есть docx)
+                continue
+            # ----------------------------------------------
+
             if file_path not in file_states or file_states[file_path] != mtime:
                 files_to_reindex.append((file_path, filename))
         
@@ -804,6 +1043,13 @@ def sync_vector_db(self=None):
             except Exception as e:
                 print(f"Ошибка индексации {filename}: {e}")
                 
+        # Оповещение о нерасшифрованных аудио в чат
+        if untranscribed_audio and self is not None:
+            unique_audio = list(set(untranscribed_audio))
+            display_names = ", ".join(unique_audio[:5]) + ("..." if len(unique_audio) > 5 else "")
+            msg = f"\n[Система: ⚠️ В базе обнаружены нерасшифрованные аудиофайлы ({len(unique_audio)} шт.): {display_names}. Запустить транскрибацию?]\n\n"
+            self.after(0, lambda m=msg: self.append_to_chat(m))
+
         save_file_states(new_file_states)
 
         if self is not None and getattr(self, "current_role", "guest") == "admin":
@@ -1844,13 +2090,20 @@ def generate_excel_from_scratch(task_description, new_filename, app_instance=Non
 DEFAULT_LOCAL_SETTINGS = {
     "guest_model": "stepfun/step-3.5-flash:free",
     "admin_model": "openai/gpt-4o-mini",
-    "model_history": []
+    "model_history": [],
+    "use_proxy": False,
+    "proxy_host": "127.0.0.1",
+    "proxy_port": "2080"
 }
 
 DEFAULT_GLOBAL_SETTINGS = {
     "vision_model": "openai/gpt-4o-mini",
     "secretary_model": "stepfun/step-3.5-flash:free",
     "embedding_model": "qwen/qwen3-embedding-8b",
+    "audio_provider": "OpenRouter",
+    "audio_model": "openai/gpt-4o-audio-preview",
+    "audio_chunk_mins": 60,
+    "audio_overlap_secs": 15,
     "indexed_folders": [],
     "exclude_keywords": ["архив", "not_index", "old", "черновик", "секретно"],
     "default_excel_file": "Журнал регистрации результатов аудитов.xlsx",
@@ -1902,11 +2155,11 @@ def save_global_settings(data):
 # ==================== GUI ПРИЛОЖЕНИЕ ====================
 
 APP_NAME = "ИИ-Агент СМК"
-APP_VERSION = "v1.5.1 Enterprise"
+APP_VERSION = "v1.6.0 Enterprise"
 APP_DEVELOPER = "Плаксунов В.Б."
 APP_PHONE = "2166"
 APP_DESCRIPTION = (
-    "1.5.1 - Исправлено слепота в папках"
+    "1.6.0 - Появилась возможность читать аудио файлы и транскрибировать их.\n"
     "Корпоративный ИИ-ассистент для Системы Менеджмента Качества (СМК).\n"
     "Приложение помогает анализировать документы, выполнять аудит,\n"
     "искать информацию по базе знаний и формировать рабочие материалы.\n"
@@ -2586,6 +2839,9 @@ class App(ctk.CTk):
         # Флаг для удобного разделения прав
         is_admin = (self.current_role == "admin")
         tab_security = tabview.add("Безопасность 🔒") if is_admin else None
+        
+        # --- ВКЛАДКА: АУДИО И СЕТЬ (ТОЛЬКО ДЛЯ АДМИНА) ---
+        tab_audio_net = tabview.add("Аудио и Сеть") if is_admin else None
 
         # --- ВКЛАДКА 1: МОДЕЛИ ---
         ctk.CTkLabel(tab_models, text="ID Модели (OpenRouter):").pack(pady=(10, 0))
@@ -2620,6 +2876,7 @@ class App(ctk.CTk):
         if not is_admin: embed_entry.configure(state="disabled", text_color="gray")
 
         openrouter_entry = None
+        groq_entry = None
         tavily_entry = None
         admin_pwd_entry = None
         if is_admin and tab_security is not None:
@@ -2629,6 +2886,11 @@ class App(ctk.CTk):
             openrouter_entry = ctk.CTkEntry(tab_security, width=450, show="*")
             openrouter_entry.pack(pady=5)
             openrouter_entry.insert(0, vault_data.get("openrouter_key", ""))
+
+            ctk.CTkLabel(tab_security, text="Groq API Key:").pack(pady=(10, 0))
+            groq_entry = ctk.CTkEntry(tab_security, width=450, show="*")
+            groq_entry.pack(pady=5)
+            groq_entry.insert(0, vault_data.get("groq_key", ""))
 
             ctk.CTkLabel(tab_security, text="Tavily API Key:").pack(pady=(10, 0))
             tavily_entry = ctk.CTkEntry(tab_security, width=450, show="*")
@@ -2688,6 +2950,102 @@ class App(ctk.CTk):
         folders_scroll.pack(pady=5, fill="both", expand=True)
         render_folders()
 
+        # --- ВКЛАДКА: АУДИО И СЕТЬ (ТОЛЬКО ДЛЯ АДМИНА) ---
+        if is_admin and tab_audio_net is not None:
+            ctk.CTkLabel(tab_audio_net, text="Провайдер Аудио:").pack(pady=(10, 0))
+            audio_provider_var = ctk.StringVar(value=self.global_settings.get("audio_provider", "OpenRouter"))
+
+            audio_model_entry = ctk.CTkComboBox(tab_audio_net, width=450, values=["Загрузка..."])
+            audio_model_entry.set("Загрузка...")
+
+            def update_audio_models(choice):
+                # Временно блокируем ввод, пока идет загрузка
+                audio_model_entry.configure(state="disabled")
+                audio_model_entry.set("Загрузка моделей...")
+
+                def fetch_and_update():
+                    if choice == "Groq":
+                        models = ["whisper-large-v3-turbo", "whisper-large-v3", "distil-whisper-large-v3-en"]
+                    else:
+                        # Базовый список 100% проверенных аудиомоделей
+                        models = [
+                            "openai/gpt-4o-audio-preview",
+                            "openai/gpt-audio-mini",
+                            "google/gemini-2.5-flash",
+                            "google/gemini-2.0-flash-001"
+                        ]
+                        try:
+                            resp = requests.get("https://openrouter.ai/api/v1/models", timeout=8)
+                            data = resp.json().get("data", [])
+                            for m in data:
+                                m_id = str(m.get("id", ""))
+                                m_id_low = m_id.lower()
+                                # Ищем слова-маркеры в названии модели
+                                if "audio" in m_id_low or "whisper" in m_id_low or "voxtral" in m_id_low or "mimo" in m_id_low:
+                                    if m_id not in models:
+                                        models.append(m_id)
+                        except Exception as e:
+                            print(f"Ошибка загрузки моделей OpenRouter: {e}")
+                    
+                    audio_model_entry.winfo_toplevel().after(0, lambda: apply_models(models, choice))
+
+                def apply_models(models, current_choice):
+                    audio_model_entry.configure(values=models, state="normal")
+
+                    # Пытаемся восстановить ранее сохраненную модель
+                    saved_model = self.global_settings.get("audio_model", "")
+                    saved_provider = self.global_settings.get("audio_provider", "OpenRouter")
+
+                    if current_choice == saved_provider and saved_model in models:
+                        audio_model_entry.set(saved_model)
+                    else:
+                        audio_model_entry.set(models[0])
+
+                # Запускаем загрузку в фоне, чтобы интерфейс не зависал
+                import threading
+                threading.Thread(target=fetch_and_update, daemon=True).start()
+
+            audio_provider_menu = ctk.CTkOptionMenu(
+                tab_audio_net,
+                variable=audio_provider_var,
+                values=["OpenRouter", "Groq"],
+                command=update_audio_models
+            )
+            audio_provider_menu.pack(pady=5)
+
+            ctk.CTkLabel(tab_audio_net, text="Модель Аудио (можно вписать свою):").pack(pady=(10, 0))
+            audio_model_entry.pack(pady=5)
+
+            # Первичная инициализация списка при открытии окна
+            update_audio_models(audio_provider_var.get())
+
+            ctk.CTkLabel(tab_audio_net, text="Длина куска (мин):").pack(pady=(10, 0))
+            audio_chunk_entry = ctk.CTkEntry(tab_audio_net, width=450)
+            audio_chunk_entry.pack(pady=5)
+            audio_chunk_entry.insert(0, str(self.global_settings.get("audio_chunk_mins", 60)))
+
+            ctk.CTkLabel(tab_audio_net, text="Перекрытие (сек):").pack(pady=(10, 0))
+            audio_overlap_entry = ctk.CTkEntry(tab_audio_net, width=450)
+            audio_overlap_entry.pack(pady=5)
+            audio_overlap_entry.insert(0, str(self.global_settings.get("audio_overlap_secs", 15)))
+
+            proxy_checkbox = ctk.CTkCheckBox(tab_audio_net, text="Использовать SOCKS5 Proxy")
+            proxy_checkbox.pack(pady=(14, 5), anchor="w", padx=50)
+            if bool(self.current_settings.get("use_proxy", False)):
+                proxy_checkbox.select()
+            else:
+                proxy_checkbox.deselect()
+
+            ctk.CTkLabel(tab_audio_net, text="Proxy Host:").pack(pady=(10, 0))
+            proxy_host_entry = ctk.CTkEntry(tab_audio_net, width=450)
+            proxy_host_entry.pack(pady=5)
+            proxy_host_entry.insert(0, str(self.current_settings.get("proxy_host", "127.0.0.1")))
+
+            ctk.CTkLabel(tab_audio_net, text="Proxy Port:").pack(pady=(10, 0))
+            proxy_port_entry = ctk.CTkEntry(tab_audio_net, width=450)
+            proxy_port_entry.pack(pady=5)
+            proxy_port_entry.insert(0, str(self.current_settings.get("proxy_port", "2080")))
+
         # --- ВКЛАДКА 4: О ПРОГРАММЕ ---
         ctk.CTkLabel(tab_about, text=APP_NAME, font=ctk.CTkFont(size=20, weight="bold")).pack(pady=(20, 8))
         ctk.CTkLabel(tab_about, text=f"Версия: {APP_VERSION}", font=ctk.CTkFont(size=14)).pack(pady=4)
@@ -2706,8 +3064,24 @@ class App(ctk.CTk):
                 self.current_settings["admin_model"] = new_model
             else:
                 self.current_settings["guest_model"] = new_model
-            
+
             if is_admin:
+                # Настройки Аудио и Прокси (СОХРАНЯЕТ ТОЛЬКО АДМИН)
+                self.global_settings["audio_provider"] = audio_provider_var.get()
+                self.global_settings["audio_model"] = audio_model_entry.get().strip()
+                try:
+                    self.global_settings["audio_chunk_mins"] = int((audio_chunk_entry.get().strip() or "60"))
+                except Exception:
+                    self.global_settings["audio_chunk_mins"] = 60
+                try:
+                    self.global_settings["audio_overlap_secs"] = int((audio_overlap_entry.get().strip() or "15"))
+                except Exception:
+                    self.global_settings["audio_overlap_secs"] = 15
+
+                self.current_settings["use_proxy"] = bool(proxy_checkbox.get())
+                self.current_settings["proxy_host"] = proxy_host_entry.get().strip() or "127.0.0.1"
+                self.current_settings["proxy_port"] = proxy_port_entry.get().strip() or "2080"
+
                 # 1. Обновление истории топ-10 моделей
                 history = self.current_settings.get("model_history", [])
                 if new_model in history:
@@ -2730,6 +3104,7 @@ class App(ctk.CTk):
                 # 4. Сохранение Vault
                 new_vault = {
                     "openrouter_key": openrouter_entry.get().strip() if openrouter_entry else "",
+                    "groq_key": groq_entry.get().strip() if groq_entry else "",
                     "tavily_key": tavily_entry.get().strip() if tavily_entry else "",
                     "admin_password": (admin_pwd_entry.get().strip() if admin_pwd_entry else "admin") or "admin"
                 }
@@ -2745,15 +3120,50 @@ class App(ctk.CTk):
     def get_tools_schema(self):
         tools = [
             {
-                "type": "function", 
+                "type": "function",
+                "function": {
+                    "name": "list_available_files",
+                    "description": "Умный навигатор по папкам. Выдает структурированный список всех доступных файлов. Вызывай этот инструмент, если пользователь говорит: 'поищи в папках', 'какие есть файлы', 'найди все аудиофайлы', 'есть ли у нас схемы', или ищет файл по слову в названии.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "category": {
+                                "type": "string",
+                                "enum": ["all", "audio", "excel", "word", "pdf", "image", "text", "diagram"],
+                                "description": "Тип искомых файлов. Используй 'all', если пользователь не назвал конкретный тип."
+                            },
+                            "search_keyword": {
+                                "type": "string",
+                                "description": "Слово для поиска в названии файла (например, 'транскрибация', 'отчет'). Оставь пустым для вывода всех файлов."
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                "type": "function",
                 "function": {
                     "name": "read_local_file",
-                    "description": "Прочитать текст из файла (Поддерживает .docx, .doc, .rtf, .txt, .md, .pdf, .png, .jpg, .jpeg, .xlsx, .xls, .graphml блок-схемы). Для PDF/изображений используется smart vision роутер с кэшем. ВАЖНО: Если тебе нужно узнать содержимое директории, передай сюда путь к папке (например 'SMK_Docs/Протоколы'), и инструмент вернет тебе список файлов внутри нее.",
+                    "description": "Прочитать текст из файла (Поддерживает .docx, .doc, .rtf, .txt, .md, .pdf, .png, .jpg, .jpeg, .xlsx, .xls, .graphml блок-схемы, а также .mp3/.wav/.m4a/.ogg с системной меткой транскрибации). Для PDF/изображений используется smart vision роутер с кэшем. ВАЖНО: Если тебе нужно узнать содержимое директории, передай сюда путь к папке (например 'SMK_Docs/Протоколы'), и инструмент вернет тебе список файлов внутри нее.",
                     "parameters": {
                         "type": "object", 
                         "properties": {
                             "filename": {"type": "string", "description": "Имя файла или путь к папке"}
                         }, 
+                        "required": ["filename"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "transcribe_audio_file",
+                    "description": "Запустить процесс текстовой расшифровки (транскрибации) аудиофайла (.mp3, .wav, .m4a). Вызывает нейросеть для распознавания голоса и создает Word-документ с протоколом. ВНИМАНИЕ: Процесс долгий и платный. Вызывать СТРОГО только после получения явного согласия пользователя!",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "filename": {"type": "string", "description": "Имя аудиофайла (например, запись_совещания.mp3)"}
+                        },
                         "required": ["filename"]
                     }
                 }
@@ -3041,7 +3451,9 @@ class App(ctk.CTk):
         return tools
 
     def execute_tool(self, func_name, args):
-        if func_name == "read_local_file": return read_local_file(args.get("filename"))
+        if func_name == "list_available_files": return list_available_files(args.get("category", "all"), args.get("search_keyword", ""))
+        elif func_name == "read_local_file": return read_local_file(args.get("filename"))
+        elif func_name == "transcribe_audio_file": return transcribe_audio_logic(args.get("filename"), self)
         elif func_name == "search_smk_knowledge_base": return search_smk_knowledge_base(args.get("query"))
         elif func_name == "web_search_tavily": return web_search_tavily(args.get("query"))
         elif func_name == "search_wikipedia": return search_wikipedia_tool(args.get("query"))
@@ -3094,6 +3506,8 @@ class App(ctk.CTk):
             "ШАГ 1. СВЕРКА: При любом запросе СНАЧАЛА вызывай 'search_smk_knowledge_base'.\n"
             "ШАГ 1.1. ПРОВЕРКА ИНТЕРНЕТА: Если в локальной базе знаний нет ответа на вопрос пользователя, ты НЕ ИМЕЕШЬ ПРАВА сразу придумывать ответ или искать его в сети. Сначала напиши пользователю: 'В нашей локальной базе СМК нет этой информации. Где мне поискать ответ: в интернете (Tavily) или в Википедии?'.\n"
             "ШАГ 1.2. Дождись ответа. Если пользователь выбрал интернет - вызови 'web_search_tavily'. Если Википедию - вызови 'search_wikipedia'. ПРИ ОТВЕТЕ ИЗ ВНЕШНЕЙ СЕТИ ОБЯЗАТЕЛЬНО УКАЗЫВАЙ ПРЯМЫЕ ВЕБ-ССЫЛКИ на источники (http...).\n"
+            "ШАГ 1.3. АУДИОФАЙЛЫ: Если пользователь просит тебя проанализировать или пересказать аудиофайл, ВЫЗОВИ инструмент 'read_local_file' с именем этого аудио. Инструмент сам достанет текст из кэша. Если же в кэше пусто (инструмент вернет предупреждение), ТЫ НЕ ИМЕЕШЬ ПРАВА вызывать 'transcribe_audio_file' без разрешения. Обязательно спроси: 'Я вижу аудиофайл. Запустить расшифровку голоса в текст?'. Вызывай 'transcribe_audio_file' ТОЛЬКО после слова 'Да' от пользователя.\n"
+            "ШАГ 1.4. НАВИГАЦИЯ ПО ПАПКАМ: Если пользователь задает общие вопросы вроде 'поищи в папках', 'найди все аудиофайлы', 'есть ли документы с названием X', СНАЧАЛА ОБЯЗАТЕЛЬНО вызови 'list_available_files'. Этот инструмент выдаст тебе сгруппированную структуру папок и файлов. Изучи этот список и только потом отвечай пользователю или запускай чтение/расшифровку конкретных файлов.\n"
             "ШАГ 2. ПРАВКИ В ДОКУМЕНТЕ (WORD): Если просят исправить текстовый документ, прочитай его и ТОЛЬКО после согласия вызови 'apply_indexed_edits'.\n"
             f"ШАГ 3. ТАБЛИЦЫ (EXCEL): Если просят проверить, добавить или обновить несоответствие в Excel (по умолчанию файл '{self.current_settings.get('default_excel_file', '')}'):\n"
             "   А) СНАЧАЛА ОБЯЗАТЕЛЬНО вызови 'smart_excel_search', чтобы найти контекст и старые записи.\n"
