@@ -51,7 +51,7 @@ import copy
 from bs4 import BeautifulSoup
 import markdownify
 import urllib3
-from urllib.parse import urlparse, unquote, quote
+from urllib.parse import urlparse, unquote, quote, urljoin
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Регулярка для очистки MSG_ID из потокового текста
@@ -368,6 +368,81 @@ def extract_smart_vision_and_pdf(filepath):
     except Exception as e:
         return f"Ошибка smart vision/parsing: {str(e)}"
 
+def process_xwiki_attachments(html_text, page_url, auth, app_instance=None):
+    """
+    Парсит HTML страницы XWiki, находит вложения, скачивает их (с проверкой кэша)
+    и подменяет HTML-теги на текстовые якоря для RAG.
+    
+    Args:
+        html_text: HTML контент страницы XWiki
+        page_url: URL страницы (для разрешения относительных ссылок)
+        auth: HTTPBasicAuth для аутентификации
+        app_instance: Опционально, экземпляр GUI для отображения прогресса
+    
+    Returns:
+        tuple: (Модифицированный HTML с заменёнными тегами вложений, список имён валидных файлов вложений)
+    """
+    from urllib.parse import urljoin, urlparse, unquote
+    import hashlib
+    
+    attachments_dir = os.path.join(get_base_path(), ".cache", "xwiki_sync", "attachments")
+    os.makedirs(attachments_dir, exist_ok=True)
+    
+    soup = BeautifulSoup(html_text, 'html.parser')
+    links = soup.find_all('a', href=True)
+    
+    downloaded_files = set()  # Для предотвращения дублей на одной странице
+    valid_attachment_names = []  # Список всех валидных имён вложений для белого списка GC
+    
+    for a_tag in links:
+        href = a_tag['href']
+        
+        # Ищем ссылки на вложения XWiki
+        if '/download/' in href.lower() or 'attachment' in href.lower():
+            full_download_url = urljoin(page_url, href)
+            
+            # Извлекаем оригинальное имя файла из URL
+            parsed_url = urlparse(full_download_url)
+            original_filename = unquote(os.path.basename(parsed_url.path))
+            
+            if not original_filename:
+                continue
+            
+            # Генерируем хэш от ПОЛНОГО URL (включая ?rev=...), чтобы отслеживать версии
+            file_hash = hashlib.md5(full_download_url.encode('utf-8')).hexdigest()[:8]
+            safe_filename = f"{file_hash}_{original_filename}"
+            valid_attachment_names.append(safe_filename)
+            save_path = os.path.join(attachments_dir, safe_filename)
+            
+            # Скачиваем файл, если его ещё нет на диске и мы его не качали в этой сессии
+            if not os.path.exists(save_path) and safe_filename not in downloaded_files:
+                try:
+                    if app_instance and hasattr(app_instance, 'file_progress_label'):
+                        app_instance.file_progress_label.configure(
+                            text=f"Скачивание: {original_filename[:15]}..."
+                        )
+                    
+                    file_resp = requests.get(full_download_url, auth=auth, verify=False)
+                    file_resp.raise_for_status()
+                    
+                    with open(save_path, 'wb') as f:
+                        f.write(file_resp.content)
+                    downloaded_files.add(safe_filename)
+                    
+                    if app_instance and hasattr(app_instance, 'file_progress_label'):
+                        app_instance.file_progress_label.configure(text="Готово")
+                        
+                except Exception as e:
+                    print(f"Ошибка скачивания вложения {original_filename}: {e}")
+                    continue
+            
+            # Подменяем HTML-тег на якорь
+            # Оборачиваем в строку, которую markdownify не удалит
+            anchor_text = f"[Вложение: {safe_filename}]"
+            a_tag.replace_with(anchor_text)
+    
+    return str(soup), valid_attachment_names
+
 def sync_xwiki(app_instance=None):
     """
     Синхронизация документов с XWiki.
@@ -386,7 +461,7 @@ def sync_xwiki(app_instance=None):
             print("XWiki: логин или пароль не настроены")
             return
 
-        xwiki_urls = getattr(app_instance, "global_settings", {}).get("xwiki_urls", [])
+        xwiki_urls = load_global_settings().get("xwiki_urls", [])
         xwiki_dir = os.path.join(get_base_path(), ".cache", "xwiki_sync")
         
         if not xwiki_urls:
@@ -614,6 +689,18 @@ def sync_xwiki(app_instance=None):
                             active_images.add(img_name)
                     # -----------------------------------------------------------------
                     
+                    # --- Защищаем вложения неизмененной страницы ---
+                    for a_tag in content_block.find_all('a', href=True):
+                        a_href = a_tag.get('href', '')
+                        if '/download/' in a_href.lower() or 'attachment' in a_href.lower():
+                            full_dl_url = urljoin(current_url, a_href)
+                            parsed_dl = urlparse(full_dl_url)
+                            orig_fname = unquote(os.path.basename(parsed_dl.path))
+                            if orig_fname:
+                                f_hash = hashlib.md5(full_dl_url.encode('utf-8')).hexdigest()[:8]
+                                active_images.add(f"{f_hash}_{orig_fname}")
+                    # -----------------------------------------------------------------
+                    
                     processed_count += 1
                     continue
 
@@ -663,8 +750,15 @@ def sync_xwiki(app_instance=None):
                     except Exception as e:
                         print(f"XWiki: ошибка Vision для {src}: {e}")
 
+                # Обработка вложений XWiki (скачивание и подмена ссылок на якоря)
+                processed_html, current_page_attachments = process_xwiki_attachments(str(content_copy), current_url, session.auth, app_instance)
+                active_images.update(current_page_attachments)
+
                 # Markdown и Сохранение
-                md_text = markdownify.markdownify(str(content_copy), heading_style="ATX", autolinks=False)
+                md_text = markdownify.markdownify(processed_html, heading_style="ATX", autolinks=False)
+
+                # Фиксим экранирование символов, которое ломает пути к файлам
+                md_text = md_text.replace(r"\_", "_").replace(r"\[", "[").replace(r"\]", "]")
 
                 # Извлекаем Title
                 title = ""
@@ -1082,6 +1176,17 @@ def find_target_file(filename):
     try:
         if os.path.isabs(filename) and os.path.exists(filename):
             return filename
+
+        # --- Умный поиск вложений XWiki (поддержка обрезанных имен без хэша) ---
+        clean_search_name = os.path.basename(filename)
+        xwiki_attach_dir = os.path.join(get_base_path(), ".cache", "xwiki_sync", "attachments")
+        
+        if os.path.exists(xwiki_attach_dir):
+            for f in os.listdir(xwiki_attach_dir):
+                if f == clean_search_name or f.endswith(f"_{clean_search_name}"):
+                    return os.path.join(xwiki_attach_dir, f)
+        # -----------------------------------------------------------------------
+
         if os.path.exists(filename):
             return filename
 
@@ -1375,13 +1480,13 @@ def sync_vector_db(self=None):
         if self is not None and getattr(self, "current_role", "guest") != "admin":
             return collection, collection.count()
         
-        # Синхронизация XWiki
+        # Синхронизация XWiki только при ручном запуске из UI
         if self is not None:
             self.after(0, lambda: self.file_progress_label.configure(text="Синхронизация XWiki (может занять время)..."))
-        try:
-            sync_xwiki(self)
-        except Exception as e:
-            print(f"Ошибка синхронизации XWiki: {e}")
+            try:
+                sync_xwiki(self)
+            except Exception as e:
+                print(f"Ошибка синхронизации XWiki: {e}")
         
         settings = load_global_settings()
         # пользовательские папки
@@ -1606,7 +1711,20 @@ def memorize_important_fact(fact):
         if not os.path.exists(memory_file):
             with open(memory_file, "w", encoding="utf-8") as f: f.write("# Долгосрочная память ИИ-Агента\n\n")
         with open(memory_file, "a", encoding="utf-8") as f: f.write(f"- [{date_str}] {fact}\n")
-        sync_vector_db()
+
+        client = chromadb.PersistentClient(path=get_db_path())
+        collection = client.get_or_create_collection(name="smk_docs", embedding_function=get_cloud_ef())
+        collection.delete(where={"file_path": memory_file})
+
+        with open(memory_file, "r", encoding="utf-8") as f:
+            text = f.read()
+
+        chunks = chunk_text(text)
+        if chunks:
+            ids = [f"{memory_file}_chunk_{j}" for j in range(len(chunks))]
+            metadatas = [{"source": "agent_memory.md", "file_path": memory_file} for _ in chunks]
+            collection.upsert(documents=chunks, ids=ids, metadatas=metadatas)
+
         return f"Факт успешно сохранен и проиндексирован."
     except Exception as e: return f"Ошибка памяти: {str(e)}"
 
@@ -1621,7 +1739,20 @@ def forget_fact(query):
         if line_to_delete == "NOT_FOUND": return "Факт не найден."
         new_lines = [line for line in lines if line_to_delete not in line]
         with open(memory_file, "w", encoding="utf-8") as f: f.writelines(new_lines)
-        sync_vector_db()
+
+        client = chromadb.PersistentClient(path=get_db_path())
+        collection = client.get_or_create_collection(name="smk_docs", embedding_function=get_cloud_ef())
+        collection.delete(where={"file_path": memory_file})
+
+        with open(memory_file, "r", encoding="utf-8") as f:
+            text = f.read()
+
+        chunks = chunk_text(text)
+        if chunks:
+            ids = [f"{memory_file}_chunk_{j}" for j in range(len(chunks))]
+            metadatas = [{"source": "agent_memory.md", "file_path": memory_file} for _ in chunks]
+            collection.upsert(documents=chunks, ids=ids, metadatas=metadatas)
+
         return f"Факт удален."
     except Exception as e: return f"Ошибка удаления: {str(e)}"
 
@@ -2536,7 +2667,11 @@ DEFAULT_LOCAL_SETTINGS = {
     "model_history": [],
     "use_proxy": False,
     "proxy_host": "127.0.0.1",
-    "proxy_port": "2080"
+    "proxy_port": "2080",
+    "auto_read_files": True,
+    "deep_audit_enabled": False,
+    "auditor_model": "",
+    "use_main_model_for_audit": True
 }
 
 DEFAULT_GLOBAL_SETTINGS = {
@@ -2747,17 +2882,56 @@ class App(ctk.CTk):
             hover_color="#263238"
         )
         self.auth_btn.grid(row=5, column=0, padx=20, pady=(8, 0), sticky="s")
+        
+        # --- Тумблер автономного чтения ---
+        def toggle_auto_read():
+            if getattr(self, "current_role", "guest") == "admin":
+                self.current_settings["auto_read_files"] = self.auto_read_switch.get() == 1
+                save_local_settings(self.current_settings)
+
+        self.auto_read_switch = ctk.CTkSwitch(
+            self.sidebar_frame,
+            text="Автономное чтение файлов",
+            font=ctk.CTkFont(size=11),
+            command=toggle_auto_read
+        )
+        self.auto_read_switch.grid(row=6, column=0, padx=20, pady=(15, 0), sticky="s")
+        # ----------------------------------------
+
+        # --- Тумблер глубокого аудита (Рефлексия) ---
+        def toggle_deep_audit():
+            self.current_settings["deep_audit_enabled"] = self.deep_audit_switch.get() == 1
+            save_local_settings(self.current_settings)
+
+        self.deep_audit_switch = ctk.CTkSwitch(
+            self.sidebar_frame,
+            text="Глубокий аудит (Рефлексия)",
+            font=ctk.CTkFont(size=11),
+            command=toggle_deep_audit
+        )
+        self.deep_audit_switch.grid(row=7, column=0, padx=20, pady=(8, 0), sticky="s")
+        if self.current_settings.get("deep_audit_enabled", False):
+            self.deep_audit_switch.select()
+        else:
+            self.deep_audit_switch.deselect()
+        # Гость: глубокий аудит обязателен — принудительно включаем
+        if self.current_role == "guest":
+            self.deep_audit_switch.select()
+            self.current_settings["deep_audit_enabled"] = True
+            save_local_settings(self.current_settings)
+        # --------------------------------------------
+
         self.update_ui_for_role()
 
         self.progress_bar = ctk.CTkProgressBar(self.sidebar_frame)
-        self.progress_bar.grid(row=6, column=0, padx=20, pady=(8, 4), sticky="ew")
+        self.progress_bar.grid(row=8, column=0, padx=20, pady=(15, 4), sticky="ew")
         self.progress_bar.set(0)
 
         self.file_progress_label = ctk.CTkLabel(self.sidebar_frame, text="Ожидание синхронизации", font=ctk.CTkFont(size=11))
-        self.file_progress_label.grid(row=7, column=0, padx=20, pady=(0, 6), sticky="w")
+        self.file_progress_label.grid(row=9, column=0, padx=20, pady=(0, 6), sticky="w")
         
         self.status_label = ctk.CTkLabel(self.sidebar_frame, text="Загрузка...", font=ctk.CTkFont(size=12))
-        self.status_label.grid(row=8, column=0, padx=20, pady=(5, 15))
+        self.status_label.grid(row=10, column=0, padx=20, pady=(5, 15))
         
         self.chat_frame = ctk.CTkFrame(self)
         self.chat_frame.grid(row=0, column=1, padx=10, pady=10, sticky="nsew")
@@ -2777,6 +2951,9 @@ class App(ctk.CTk):
         text_widget.tag_config("h1", font=ctk.CTkFont(family="Segoe UI", size=22, weight="bold"), foreground="#FF8C00")
         text_widget.tag_config("h2", font=ctk.CTkFont(family="Segoe UI", size=18, weight="bold"), foreground="#00BFFF")
         text_widget.tag_config("h3", font=ctk.CTkFont(family="Segoe UI", size=16, weight="bold"), foreground="#4FC3F7")
+        text_widget.tag_config("h4", font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"), foreground="#64B5F6")
+        text_widget.tag_config("h5", font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"), foreground="#81C784")
+        text_widget.tag_config("h6", font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold", slant="italic"), foreground="#90A4AE")
         # Убрали фон и цвет текста у таблицы для адаптивности под темы
         text_widget.tag_config("table", font=ctk.CTkFont(family="Consolas", size=13), wrap="none", justify="center")
         text_widget.tag_config("hr", foreground="#555555")
@@ -2908,6 +3085,30 @@ class App(ctk.CTk):
                         self.unbind(old_release)
                     except Exception:
                         pass
+        # Управление тумблером автономного чтения
+        if hasattr(self, "auto_read_switch"):
+            if is_admin:
+                self.auto_read_switch.configure(state="normal")
+                if self.current_settings.get("auto_read_files", True):
+                    self.auto_read_switch.select()
+                else:
+                    self.auto_read_switch.deselect()
+            else:
+                self.auto_read_switch.select()  # У гостя всегда включено
+                self.auto_read_switch.configure(state="disabled")
+        # Управление тумблером глубокого аудита
+        if hasattr(self, "deep_audit_switch"):
+            if is_admin:
+                self.deep_audit_switch.configure(state="normal")
+                if self.current_settings.get("deep_audit_enabled", False):
+                    self.deep_audit_switch.select()
+                else:
+                    self.deep_audit_switch.deselect()
+            else:
+                self.deep_audit_switch.select()  # У гостя глубокий аудит включён по умолчанию
+                self.current_settings["deep_audit_enabled"] = True  # Синхронизируем настройку
+                save_local_settings(self.current_settings)
+                self.deep_audit_switch.configure(state="normal")  # Гость может выключить вручную
 
     def apply_audio_hotkey(self):
         """Привязка динамических горячих клавиш для записи аудио."""
@@ -3209,6 +3410,64 @@ class App(ctk.CTk):
         self.chat_textbox.see("end")
         self.chat_textbox.configure(state="disabled")
 
+    def highlight_attachments(self):
+        """Сканирует чат и делает теги [Вложение: ...] кликабельными."""
+        # Настраиваем визуальный стиль ссылки
+        self.chat_textbox.tag_config("attachment_link", foreground="#1f6aa5", underline=True)
+        # Меняем курсор при наведении (обращаемся к базовому виджету tk.Text)
+        self.chat_textbox.tag_bind("attachment_link", "<Enter>", lambda e: self.chat_textbox._textbox.configure(cursor="hand2"))
+        self.chat_textbox.tag_bind("attachment_link", "<Leave>", lambda e: self.chat_textbox._textbox.configure(cursor="arrow"))
+        self.chat_textbox.tag_bind("attachment_link", "<Button-1>", self.open_attachment_from_ui)
+
+        # Очищаем старые теги, чтобы избежать наслоений
+        self.chat_textbox.tag_remove("attachment_link", "1.0", "end")
+
+        # Ищем все совпадения по регулярному выражению в тексте
+        start_idx = "1.0"
+        while True:
+            # Ищем начало маркера
+            pos = self.chat_textbox._textbox.search(r"\[Вложение:[^\]]+\]", start_idx, stopindex="end", regexp=True)
+            if not pos:
+                break
+            
+            # Находим конец маркера (закрывающую скобку)
+            end_pos = self.chat_textbox._textbox.search(r"\]", pos, stopindex="end", regexp=True)
+            if not end_pos:
+                break
+            
+            end_pos = f"{end_pos}+1c"  # Включаем саму скобку в тег
+            self.chat_textbox.tag_add("attachment_link", pos, end_pos)
+            start_idx = end_pos
+
+    def open_attachment_from_ui(self, event):
+        """Обрабатывает клик по ссылке вложения и открывает файл в ОС."""
+        # Получаем индекс места клика
+        index = self.chat_textbox._textbox.index(f"@{event.x},{event.y}")
+        
+        # Ищем, на какой именно диапазон кликнули
+        ranges = self.chat_textbox._textbox.tag_ranges("attachment_link")
+        for i in range(0, len(ranges), 2):
+            start = ranges[i]
+            end = ranges[i+1]
+            if self.chat_textbox._textbox.compare(start, "<=", index) and self.chat_textbox._textbox.compare(index, "<=", end):
+                text = self.chat_textbox._textbox.get(start, end)
+                
+                # Извлекаем имя файла: "[Вложение: План.docx]" -> "План.docx"
+                filename = text.replace("[Вложение:", "").replace("]", "").strip()
+                
+                # Ищем файл в кэше через умный локатор
+                filepath = find_target_file(filename)
+                
+                if filepath and os.path.exists(filepath):
+                    try:
+                        os.startfile(filepath)  # Для Windows
+                    except AttributeError:
+                        import subprocess
+                        subprocess.call(['open', filepath])  # Для Mac/Linux
+                else:
+                    self.append_to_chat(f"\n⚠️ [Система: Файл '{filename}' не найден в кэше. Возможно, он был удален.]\n", "system")
+                break
+
     def generate_unicode_table(self, raw_table, max_chars=100):
         lines = raw_table.strip().split('\n')
         parsed_rows = []
@@ -3325,7 +3584,7 @@ class App(ctk.CTk):
         end_index = self.chat_textbox.index("end-1c")
         raw_text = text_widget.get(start_index, end_index)
 
-        for match in re.finditer(r'^(#{1,3})\s+(.*?)$', raw_text, re.MULTILINE):
+        for match in re.finditer(r'^(#{1,6})\s+(.*?)$', raw_text, re.MULTILINE):
             hashes = match.group(1)
             level = len(hashes)
             m_start, m_end = match.start(), match.end()
@@ -3505,6 +3764,8 @@ class App(ctk.CTk):
                 window_to_close.destroy()
 
             self.append_to_chat(f"\n[Система: Загружена сессия '{self.session_title}']\n")
+            # Подсвечиваем ссылки во всей загруженной истории
+            self.highlight_attachments()
         except Exception as e:
             self.append_to_chat(f"\n[Система: Ошибка загрузки сессии: {e}]\n")
 
@@ -3684,8 +3945,8 @@ class App(ctk.CTk):
         # --- ВКЛАДКА: АУДИО И СЕТЬ (ТОЛЬКО ДЛЯ АДМИНА) ---
         tab_audio_net = tabview.add("Аудио и Сеть") if is_admin else None
 
-        # --- ВКЛАДКА: XWIKI (ТОЛЬКО ДЛЯ АДМИНА) ---
-        tab_xwiki = tabview.add("XWiki 🌐") if is_admin else None
+        # --- ВКЛАДКА: XWIKI (ВИДИМА ДЛЯ ВСЕХ) ---
+        tab_xwiki = tabview.add("XWiki 🌐")
 
         # --- ВКЛАДКА 1: МОДЕЛИ ---
         ctk.CTkLabel(tab_models, text="ID Модели (OpenRouter):").pack(pady=(10, 0))
@@ -3718,6 +3979,40 @@ class App(ctk.CTk):
         embed_entry.pack(pady=5)
         embed_entry.insert(0, self.global_settings.get("embedding_model", "qwen/qwen3-embedding-8b"))
         if not is_admin: embed_entry.configure(state="disabled", text_color="gray")
+
+        # --- БЛОК НАСТРОЕК АУДИТОРА (Глубокий аудит / Рефлексия) ---
+        ctk.CTkLabel(tab_models, text="").pack()  # Разделитель
+        audit_separator = ctk.CTkFrame(tab_models, height=2, fg_color="#3a3a3a")
+        audit_separator.pack(fill="x", padx=20, pady=5)
+        ctk.CTkLabel(tab_models, text="🕵️‍♂️ Модель-Аудитор (Глубокий аудит):", font=ctk.CTkFont(weight="bold")).pack(pady=(5, 0))
+
+        use_main_model_checkbox = ctk.CTkCheckBox(tab_models, text="Использовать основную модель для аудита")
+        use_main_model_checkbox.pack(pady=(5, 0), anchor="w", padx=50)
+        if self.current_settings.get("use_main_model_for_audit", True):
+            use_main_model_checkbox.select()
+        else:
+            use_main_model_checkbox.deselect()
+
+        history = self.current_settings.get("model_history", [])
+        auditor_model_combobox = ctk.CTkComboBox(tab_models, width=450, values=history)
+        auditor_model_combobox.set(self.current_settings.get("auditor_model", ""))
+        auditor_model_combobox.pack(pady=5)
+        # Если чекбокс активен — комбобокс отключен
+        if self.current_settings.get("use_main_model_for_audit", True):
+            auditor_model_combobox.configure(state="disabled")
+        # Гость: элементы управления моделью-аудитором неактивны
+        if not is_admin:
+            use_main_model_checkbox.configure(state="disabled", text_color="gray")
+            auditor_model_combobox.configure(state="disabled", text_color="gray")
+
+        def on_use_main_model_toggle():
+            if use_main_model_checkbox.get() == 1:
+                auditor_model_combobox.configure(state="disabled")
+            else:
+                auditor_model_combobox.configure(state="normal" if is_admin else "disabled")
+
+        use_main_model_checkbox.configure(command=on_use_main_model_toggle)
+        # -----------------------------------------------------------
 
         openrouter_entry = None
         groq_entry = None
@@ -3891,9 +4186,11 @@ class App(ctk.CTk):
                 row.pack(fill="x", pady=3)
                 lbl = ctk.CTkLabel(row, text=format_xwiki_url_for_ui(url), anchor="w", wraplength=350)
                 lbl.pack(side="left", padx=5, fill="x", expand=True)
-                btn = ctk.CTkButton(row, text="−", width=30, height=24, fg_color="#D32F2F", hover_color="#B71C1C",
-                                    command=lambda u=url: remove_xwiki_url(u))
-                btn.pack(side="right", padx=5)
+                # Кнопка удаления только для Админа
+                if is_admin:
+                    btn = ctk.CTkButton(row, text="−", width=30, height=24, fg_color="#D32F2F", hover_color="#B71C1C",
+                                        command=lambda u=url: remove_xwiki_url(u))
+                    btn.pack(side="right", padx=5)
         
         def add_xwiki_url():
             dialog = ctk.CTkInputDialog(text="Вставьте браузерную ссылку на раздел XWiki:", title="Добавить XWiki")
@@ -3909,13 +4206,16 @@ class App(ctk.CTk):
                 temp_xwiki_urls.remove(url_to_remove)
                 render_xwiki_urls()
         
-        if is_admin and tab_xwiki is not None:
-            ctk.CTkLabel(tab_xwiki, text="Управление ссылками на разделы XWiki:").pack(pady=(10, 0))
+        ctk.CTkLabel(tab_xwiki, text="Управление ссылками на разделы XWiki:").pack(pady=(10, 0))
+        
+        # Кнопка добавления только для Админа
+        if is_admin:
             add_xwiki_btn = ctk.CTkButton(tab_xwiki, text="+ Добавить ссылку XWiki", command=add_xwiki_url)
             add_xwiki_btn.pack(pady=(10, 5))
-            xwiki_urls_scroll = ctk.CTkScrollableFrame(tab_xwiki, width=450, height=300)
-            xwiki_urls_scroll.pack(pady=5, fill="both", expand=True)
-            render_xwiki_urls()
+            
+        xwiki_urls_scroll = ctk.CTkScrollableFrame(tab_xwiki, width=450, height=300)
+        xwiki_urls_scroll.pack(pady=5, fill="both", expand=True)
+        render_xwiki_urls()
 
         # --- ВКЛАДКА 4: О ПРОГРАММЕ ---
         ctk.CTkLabel(tab_about, text=APP_NAME, font=ctk.CTkFont(size=20, weight="bold")).pack(pady=(20, 8))
@@ -3973,6 +4273,10 @@ class App(ctk.CTk):
                 self.global_settings["vision_model"] = vision_entry.get().strip()
                 self.global_settings["secretary_model"] = secretary_entry.get().strip()
                 self.global_settings["embedding_model"] = embed_entry.get().strip()
+                
+                # 2.1 Сохранение настроек Аудитора
+                self.current_settings["use_main_model_for_audit"] = bool(use_main_model_checkbox.get())
+                self.current_settings["auditor_model"] = auditor_model_combobox.get().strip()
                 
                 # 3. Сохранение папок и исключений
                 ex_text = excludes_entry.get("1.0", "end-1c")
@@ -4337,6 +4641,120 @@ class App(ctk.CTk):
 
         return tools
 
+    def run_deep_audit(self, user_query, draft_answer, gathered_context=""):
+        """Выполняет тихую проверку черновика ответа через OpenRouter (модель-аудитор)."""
+        import re
+
+        # Защищаем служебные ссылки от искажения моделью-аудитором
+        link_map = {}
+        link_pattern = r"(\[(?:Вложение:|Из файла:)[^\]]+\])"
+        link_index = 0
+
+        def _shield_link(match):
+            nonlocal link_index
+            original_link = match.group(1)
+            placeholder = f"[[LINK_{link_index}]]"
+            link_map[placeholder] = original_link
+            link_index += 1
+            return placeholder
+
+        shielded_draft = re.sub(link_pattern, _shield_link, draft_answer)
+
+        # 1. Выбор модели аудитора по ролям и флажку
+        if self.current_role == "guest":
+            # ГОСТЬ: всегда используем ту же модель, что выбрана как основная гостевая.
+            # Ручной выбор модели аудитора в гостевом режиме заблокирован в UI.
+            audit_model = (self.current_settings.get("guest_model", "") or "").strip()
+        else:
+            # АДМИН:
+            # - если флажок включен -> модель аудитора = основная модель админа;
+            # - если флажок выключен -> модель аудитора = значение из поля auditor_model.
+            use_main = self.current_settings.get("use_main_model_for_audit", True)
+            admin_main_model = (self.current_settings.get("admin_model", "") or self.current_settings.get("api_model", "")).strip()
+            manual_auditor_model = (self.current_settings.get("auditor_model", "") or "").strip()
+            audit_model = admin_main_model if use_main else manual_auditor_model
+        
+        if not audit_model:
+            # Без хардкода: fallback только на уже выбранную основную модель роли
+            if self.current_role == "admin":
+                audit_model = (self.current_settings.get("admin_model", "") or self.current_settings.get("api_model", "")).strip()
+            else:
+                audit_model = (self.current_settings.get("guest_model", "") or "").strip()
+
+        # 2. Динамическое ветвление промпта
+        if not gathered_context or len(gathered_context.strip()) < 10:
+            # РЕЖИМ GUARDRAIL: Контекста нет
+            system_prompt = (
+                "Ты — офицер безопасности СМК. Твоя задача: не дать Агенту выдумывать регламенты. "
+                "Тебе дан ВОПРОС пользователя и ЧЕРНОВИК ответа Агента. Контекст из базы знаний ПУСТ. "
+                "ИНСТРУКЦИЯ: "
+                "1. Если вопрос касается общих тем (приветствие, общие знания об ИИ, просьба объяснить термин СМК 'своими словами') — пропусти черновик, слегка поправив стиль. "
+                "2. Если вопрос касается КОНКРЕТНЫХ процессов компании, должностных инструкций, правил оформления документов или любых регламентов СМК — ТЫ ДОЛЖЕН ЗАБЛОКИРОВАТЬ ОТВЕТ. "
+                "В случае блокировки напиши: 'К сожалению, я не нашел в базе знаний соответствующих регламентов для точного ответа. По правилам СМК я не могу консультировать по рабочим процессам на основе догадок. Пожалуйста, уточните запрос или убедитесь, что нужные документы загружены в базу.' "
+                "ВЕРНИ ТОЛЬКО ТЕКСТ ОТВЕТА."
+            )
+        else:
+            # РЕЖИМ FACT-CHECKER: Контекст есть
+            system_prompt = (
+                "Ты — Senior Аудитор СМК. Твоя задача: проверить черновик ответа на основе предоставленного КОНТЕКСТА. "
+                "Сверь факты, удали галлюцинации. Если в черновике есть утверждения, которых нет в контексте — удали их или исправь. "
+                "Стиль: строгий, деловой. "
+                "ВЕРНИ ТОЛЬКО ИСПРАВЛЕННЫЙ ТЕКСТ ОТВЕТА."
+            )
+
+        system_prompt += (
+            " ВАЖНО: В тексте есть токены вида [[LINK_N]]. Это технические ссылки. "
+            "СТРОГО ЗАПРЕЩЕНО их удалять, изменять или переводить. "
+            "Сохраняй их в итоговом ответе в соответствующих по смыслу местах."
+        )
+
+        # 3. Формирование сообщений
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"ВОПРОС ПОЛЬЗОВАТЕЛЯ: {user_query}\n\nКОНТЕКСТ: {gathered_context}\n\nЧЕРНОВИК: {shielded_draft}"}
+        ]
+
+        # 4. Синхронный API-вызов к OpenRouter
+        vault_data = get_vault_data()
+        headers = {
+            "Authorization": f"Bearer {vault_data.get('openrouter_key', '')}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/ai-agent",
+            "X-Title": "AI-Agent-QMS"
+        }
+        payload = {
+            "model": audit_model,
+            "messages": messages,
+            "temperature": 0.1  # Строгость аудитора
+        }
+
+        try:
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=60
+            )
+            response.raise_for_status()
+            audited_text = response.json()["choices"][0]["message"]["content"].strip()
+
+            # Возвращаем оригинальные ссылки в итоговый текст
+            for placeholder, original_link in link_map.items():
+                audited_text = audited_text.replace(placeholder, original_link)
+
+            return audited_text
+        except requests.HTTPError as e:
+            error_body = ""
+            try:
+                error_body = e.response.text[:1000] if e.response is not None else ""
+            except Exception:
+                pass
+            print(f"[Deep Audit] ⚠️ HTTP ошибка аудита: {e}. model={audit_model}. body={error_body}")
+            return draft_answer
+        except Exception as e:
+            print(f"[Deep Audit] ⚠️ Ошибка аудита: {e}. Возвращаю черновик без проверки.")
+            return draft_answer
+
     def execute_tool(self, func_name, args):
         if func_name == "list_available_files": return list_available_files(args.get("category", "all"), args.get("search_keyword", ""))
         elif func_name == "read_local_file": return read_local_file(args.get("filename"))
@@ -4429,7 +4847,24 @@ class App(ctk.CTk):
             "ШАГ 7. КОММУНИКАЦИЯ (OUTLOOK): Если после аудита, записи в журнал или генерации отчета тебе нужно оповестить коллег или назначить разбор полетов, ВЫЗОВИ 'draft_email' (для писем с красивым HTML) или 'draft_meeting' (для встреч строгим плоским текстом). Если email адресата не указан явно, пиши просто ФИО.\n"
             "ШАГ 8. БЕСКОНЕЧНАЯ ПАМЯТЬ: Ты помнишь только последние 20 сообщений. Если пользователь ссылается на старые детали диалога, которых нет в текущей истории, ВЫЗОВИ инструмент 'recall_past_conversation'. НЕ используй его для поиска стандартов (для этого есть 'search_smk_knowledge_base').\n"
             "ШАГ 9. КЛИКАБЕЛЬНЫЕ ССЫЛКИ НА ФАЙЛЫ И XWIKI: Если ты упоминаешь документ СМК, нашел его через поиск или даешь ссылку на веб-страницу XWiki, ОБЯЗАТЕЛЬНО выводи её в строгом формате: [Из файла: URL_или_Имя_файла]. НИКОГДА не пиши URL открытым текстом, всегда оборачивай в [Из файла: https://...]!\n"
+            "ШАГ 10. ОБРАБОТКА ВЛОЖЕНИЙ: Если в контексте или тексте документа ты видишь якорь вида [Вложение: путь_к_файлу], СТРОГО ЗАПРЕЩЕНО выдумывать или гадать о содержимом этого файла. Ты должен написать пользователю: 'К данному документу прикреплен файл <имя файла>. Хотите, я прочитаю его содержимое?'. Если пользователь отвечает согласием (да, давай, читай и т.д.), немедленно используй инструмент read_local_file, передав ему путь из якоря (например, attachments/abc123_имя_файла.doc).\n"
         )
+        
+        # --- КОНТРОЛЬ АВТОНОМНОГО ЧТЕНИЯ ---
+        is_auto_read = True
+        if getattr(self, "current_role", "guest") == "admin":
+            is_auto_read = self.current_settings.get("auto_read_files", True)
+            
+        if not is_auto_read:
+            system_prompt += (
+                "\n\n[КРИТИЧЕСКОЕ ОГРАНИЧЕНИЕ]: РЕЖИМ АВТОНОМНОГО ЧТЕНИЯ ОТКЛЮЧЕН!\n"
+                "Тебе КАТЕГОРИЧЕСКИ ЗАПРЕЩАЕТСЯ вызывать инструмент `read_local_file` по своей инициативе для чтения текста документов. Это ПРИКАЗ! За нарушение этого правила тебе начисляются штрафные очки дефектации. Если сразу не можешь найти нужную информацию на вопрос пользователя, то делй несколько запросов в базу без обращения к чтению файлов.\n"
+                "Если для точного ответа тебе необходимо прочитать файл целиком и вызвать функцию `read_local_file`, ты ОБЯЗАТЕЛЬНО должен:\n"
+                "1. Сказать пользователю, в каком файле может быть ответ.\n"
+                "2. Явно спросить: 'Мне прочитать файл [ИМЯ_ФАЙЛА] целиком?'\n"
+                "3. ДОЖДАТЬСЯ ответа пользователя ('Да', 'Разрешаю' и т.д.) и только после этого вызывать 'read_local_file'."
+            )
+        # -----------------------------------
         
         messages_for_llm = [{"role": "system", "content": system_prompt}] + self._build_injected_messages()
         
@@ -4503,11 +4938,88 @@ class App(ctk.CTk):
                 if not merged_tool_calls:
                     # Очищаем финальный текст от MSG_ID паттерна перед сохранением
                     cleaned_final = MSG_ID_PATTERN.sub('', final_text).strip()
-                    self.chat_textbox.configure(state="normal")
-                    self.chat_textbox.insert("end", "\n\n")
-                    self.chat_textbox.configure(state="disabled")
-                    self.apply_markdown(start_index)
-                    self.chat_history.append({"role": "assistant", "content": cleaned_final, "_msg_id": agent_msg_id})
+                    draft_answer = cleaned_final  # Сохраняем черновик до возможного аудита
+
+                    # --- Собираем контекст из результатов Tool Calls для аудитора ---
+                    gathered_context = ""
+                    for msg in messages_for_llm:
+                        if msg.get("role") == "tool":
+                            gathered_context += msg.get("content", "") + "\n"
+
+                    # --- Извлекаем изначальный вопрос пользователя из истории ---
+                    prompt_text = ""
+                    for msg in reversed(self.chat_history):
+                        if msg.get("role") == "user":
+                            prompt_text = msg.get("content", "")
+                            break
+
+                    # --- Глубокий аудит (Рефлексия) ---
+                    if self.current_settings.get("deep_audit_enabled", False):
+                        # Выводим временное сообщение об аудите
+                        audit_marker = "\n🕵️‍♂️ Провожу глубокий аудит ответа...\n"
+                        self.append_to_chat(audit_marker)
+
+                        try:
+                            # Вызов аудитора (синхронный, в текущем потоке agent_loop)
+                            final_answer = self.run_deep_audit(prompt_text, draft_answer, gathered_context)
+
+                            # Удаляем временное сообщение из чата
+                            self.chat_textbox.configure(state="normal")
+                            current_text = self.chat_textbox.get("1.0", "end-1c")
+                            if current_text.endswith(audit_marker.rstrip()):
+                                # Удаляем последнюю строку с маркером
+                                lines = current_text.rsplit("\n🕵️‍♂️ Провожу глубокий аудит ответа...", 1)
+                                self.chat_textbox.delete("1.0", "end-1c")
+                                self.chat_textbox.insert("1.0", lines[0])
+                            self.chat_textbox.configure(state="disabled")
+
+                            # Заменяем текст черновика на аудитный в чате
+                            self.chat_textbox.configure(state="normal")
+                            self.chat_textbox.delete(start_index, "end-1c")
+                            self.chat_textbox.insert(start_index, final_answer)
+                            self.chat_textbox.insert("end", "\n\n")
+                            self.chat_textbox.see("end")
+                            self.chat_textbox.configure(state="disabled")
+                            self.apply_markdown(start_index)
+                            self.after(0, self.highlight_attachments)
+
+                            # Сохраняем аудитный ответ в историю
+                            self.chat_history.append({"role": "assistant", "content": final_answer, "_msg_id": agent_msg_id})
+
+                        except Exception as audit_err:
+                            # --- Graceful Fallback (ШАГ 5) ---
+                            print(f"[Deep Audit] Ошибка аудитора: {audit_err}")
+
+                            # Удаляем временное сообщение из чата
+                            self.chat_textbox.configure(state="normal")
+                            current_text = self.chat_textbox.get("1.0", "end-1c")
+                            lines = current_text.rsplit("\n🕵️‍♂️ Провожу глубокий аудит ответа...", 1)
+                            self.chat_textbox.delete("1.0", "end-1c")
+                            self.chat_textbox.insert("1.0", lines[0])
+                            self.chat_textbox.configure(state="disabled")
+
+                            # Выводим черновик + предупреждение
+                            fallback_answer = draft_answer + "\n\n*(Внимание: глубокий аудит недоступен, ответ не проверен)*"
+                            self.chat_textbox.configure(state="normal")
+                            self.chat_textbox.delete(start_index, "end-1c")
+                            self.chat_textbox.insert(start_index, fallback_answer)
+                            self.chat_textbox.insert("end", "\n\n")
+                            self.chat_textbox.see("end")
+                            self.chat_textbox.configure(state="disabled")
+                            self.apply_markdown(start_index)
+                            self.after(0, self.highlight_attachments)
+
+                            # Сохраняем комбинированный текст в историю
+                            self.chat_history.append({"role": "assistant", "content": fallback_answer, "_msg_id": agent_msg_id})
+                    else:
+                        # --- Обычный режим (без аудита) ---
+                        self.chat_textbox.configure(state="normal")
+                        self.chat_textbox.insert("end", "\n\n")
+                        self.chat_textbox.configure(state="disabled")
+                        self.apply_markdown(start_index)
+                        self.after(0, self.highlight_attachments)
+                        self.chat_history.append({"role": "assistant", "content": draft_answer, "_msg_id": agent_msg_id})
+
                     self.save_history()
 
                     # --- Логика вытеснения (Скользящее окно 20 сообщений = 10 пар) ---
@@ -4566,6 +5078,9 @@ class App(ctk.CTk):
             self.save_history()
             self.save_current_session()
         
+        # Подсвечиваем ссылки вложений после ответа Агента
+        self.after(0, self.highlight_attachments)
+
         # Выбираем последние 4 сообщения для контекста
         recent_msgs = self.chat_history[-4:]
         threading.Thread(target=self.run_background_secretary, args=(recent_msgs,), daemon=True).start()
