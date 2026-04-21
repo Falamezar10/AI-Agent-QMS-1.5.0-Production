@@ -253,8 +253,10 @@ def extract_smart_vision_and_pdf(filepath):
         cache_dir = os.path.join(get_base_path(), ".cache")
         os.makedirs(cache_dir, exist_ok=True)
         name_without_ext = os.path.splitext(filename)[0]
-        rel_path = os.path.relpath(filepath, get_base_path())
-        path_hash = hashlib.md5(rel_path.encode('utf-8')).hexdigest()[:6]
+        
+        # ИСПОЛЬЗУЕМ ABSPATH ДЛЯ ЗАЩИТЫ ОТ ОШИБКИ КРОСС-ДИСКОВЫХ ПУТЕЙ (WINDOWS)
+        abs_path = os.path.abspath(filepath)
+        path_hash = hashlib.md5(abs_path.encode('utf-8')).hexdigest()[:6]
         cache_path = os.path.join(cache_dir, f"{name_without_ext}_{path_hash}_vision.md")
 
         if os.path.exists(cache_path):
@@ -1020,6 +1022,96 @@ def extract_text_from_html_diagram(filepath):
     except Exception as e:
         return f"Ошибка парсинга HTML-диаграммы: {str(e)}"
 
+
+def safe_read_old_word_file(file_path):
+    """
+    Бронебойная песочница для чтения .doc и .rtf файлов.
+    Решает проблему сетевых дисков (Z:) и локальных дисков (C:) путем 
+    копирования файлов в локальную папку %TEMP% перед COM-конвертацией.
+    """
+    import os
+    import tempfile
+    import shutil
+    import uuid
+    import time
+    import win32com.client
+    import pythoncom
+    
+    # Инициализация COM для текущего потока
+    pythoncom.CoInitialize()
+    
+    temp_dir = tempfile.gettempdir()
+    ext = os.path.splitext(file_path)[1].lower()
+    unique_id = uuid.uuid4().hex
+    
+    temp_input_path = os.path.normpath(os.path.join(temp_dir, f"temp_in_{unique_id}{ext}"))
+    temp_output_path = os.path.normpath(os.path.join(temp_dir, f"temp_out_{unique_id}.docx"))
+    
+    text_content = ""
+    word = None
+    doc = None
+    com_text = ""
+    
+    try:
+        # 1. Стягиваем файл в локальную системную песочницу (%TEMP%)
+        shutil.copy2(file_path, temp_input_path)
+        
+        # 2. Вызываем Word для полностью локальной операции
+        word = win32com.client.DispatchEx("Word.Application")
+        word.Visible = False
+        word.DisplayAlerts = 0
+        
+        doc = word.Documents.Open(temp_input_path, False, True, False)
+        com_text = doc.Content.Text.replace('\r', '\n') # Гарантированный fallback
+        doc.SaveAs(temp_output_path, 16) # 16 = wdFormatDocumentDefault (.docx)
+        doc.Close(False)
+        
+    except Exception as e:
+        print(f"Ошибка COM-конвертации в песочнице для {file_path}: {e}")
+    finally:
+        if doc is not None:
+            try:
+                doc.Close(False)
+            except:
+                pass
+        if word is not None:
+            try:
+                word.Quit()
+            except:
+                pass
+        
+    # Даем ОС снять блокировки с файлов
+    time.sleep(0.5)
+    
+    try:
+        # 3. Читаем перекодированный .docx
+        if os.path.exists(temp_output_path):
+            parsed_raw = read_docx_with_indices(temp_output_path)
+            parsed_text = parsed_raw[0] if isinstance(parsed_raw, tuple) else parsed_raw
+            
+            if parsed_text and isinstance(parsed_text, str) and parsed_text.strip():
+                text_content = parsed_text
+            else:
+                text_content = com_text # Если парсер вернул пустоту, берем сырой текст из COM
+        else:
+            text_content = com_text
+    except Exception as e:
+        print(f"Ошибка чтения сконвертированного файла {file_path}: {e}")
+        text_content = com_text
+    finally:
+        # 4. УБИРАЕМ ЗА СОБОЙ (Удаляем оба временных файла)
+        for p in [temp_input_path, temp_output_path]:
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception as cleanup_e:
+                    print(f"Не удалось удалить временный файл {p}: {cleanup_e}")
+                    
+        # Закрываем COM-поток
+        pythoncom.CoUninitialize()
+        
+    return text_content
+
 def transcribe_audio_logic(filename, app_instance):
     target_file = find_target_file(filename)
     if not target_file:
@@ -1270,23 +1362,9 @@ def read_local_file(filename):
         elif ext.endswith('.docx'):
             return read_docx_with_indices(target_file)[0]
         elif ext.endswith(('.doc', '.rtf')):
-            # Создаем скрытую кэш-директорию
-            cache_dir = os.path.join(get_base_path(), ".cache")
-            os.makedirs(cache_dir, exist_ok=True)
-
-            # COM требует абсолютных путей
-            input_abs_path = os.path.abspath(target_file)
-            base_name = os.path.basename(input_abs_path)
-            name_without_ext = os.path.splitext(base_name)[0]
-            rel_path = os.path.relpath(input_abs_path, get_base_path())
-            path_hash = hashlib.md5(rel_path.encode('utf-8')).hexdigest()[:6]
-            output_abs_path = os.path.join(cache_dir, f"{name_without_ext}_{path_hash}_converted.docx")
-
-            success, result_path = convert_legacy_to_docx(input_abs_path, output_abs_path)
-            if success:
-                return read_docx_with_indices(result_path)[0]
-            else:
-                return f"Ошибка чтения старого формата: {result_path}"
+            # Используем безопасную локальную песочницу
+            text_content = safe_read_old_word_file(target_file)
+            return text_content
         elif ext.endswith(('.pdf', '.png', '.jpg', '.jpeg')):
             return extract_smart_vision_and_pdf(target_file)
         elif ext.endswith('.xlsx') or ext.endswith('.xls'):
@@ -1549,7 +1627,11 @@ def sync_vector_db(self=None):
             try:
                 collection.delete(where={"file_path": file_path})
                 text = read_local_file(file_path)
-                if "Ошибка" in text: continue
+                
+                # Логируем ошибку, чтобы она не была тихой
+                if isinstance(text, str) and text.startswith("Ошибка"):
+                    print(f"⚠️ [Индексатор] Пропущен файл {filename}. Причина: {text}")
+                    continue
 
                 display_source = filename
                 # Надежный поиск URL внутри файла через регулярку
@@ -3572,48 +3654,8 @@ class App(ctk.CTk):
                             text_content = extract_smart_vision_and_pdf(file_path)
                             
                         elif ext in ['.doc', '.rtf']:
-                            original_name = os.path.splitext(os.path.basename(file_path))[0]
-                            # Добавляем короткий хэш, чтобы файлы с одинаковым именем из разных папок не конфликтовали при одновременной загрузке
-                            temp_filename = f"converted_{original_name}_{uuid.uuid4().hex[:6]}.docx"
-                            
-                            raw_output_docx = os.path.join(cache_dir, temp_filename)
-                            output_docx = os.path.normpath(os.path.abspath(raw_output_docx))
-                            clean_file_path = os.path.normpath(os.path.abspath(urllib.parse.unquote(file_path)))
-                            
-                            word = win32com.client.DispatchEx("Word.Application")
-                            word.Visible = False
-                            
-                            com_text = ""
-                            try:
-                                doc = word.Documents.Open(clean_file_path)
-                                com_text = doc.Content.Text.replace('\r', '\n')
-                                doc.SaveAs(output_docx, 16)
-                                doc.Close(False)
-                            finally:
-                                word.Quit()
-                                doc = None
-                                word = None
-                            
-                            time.sleep(0.5) # Пауза для снятия блокировок ОС
-                            
-                            parsed_text = ""
-                            try:
-                                parsed_raw = read_docx_with_indices(output_docx)
-                                parsed_text = parsed_raw[0] if isinstance(parsed_raw, tuple) else parsed_raw
-                            except Exception as parser_e:
-                                print(f"Локальный парсер не прочитал файл, используем COM текст. Ошибка: {parser_e}")
-                                
-                            if parsed_text and isinstance(parsed_text, str) and parsed_text.strip():
-                                text_content = parsed_text
-                            else:
-                                text_content = com_text
-
-                            # Удаление временного файла
-                            try:
-                                if os.path.exists(output_docx):
-                                    os.remove(output_docx)
-                            except Exception as cleanup_e:
-                                print(f"Не удалось удалить кэш-файл {output_docx}: {cleanup_e}")
+                            # Вложения используют безопасную локальную песочницу
+                            text_content = safe_read_old_word_file(file_path)
                                 
                         elif role == "admin" and ext in ['.mp3', '.wav', '.m4a', '.ogg', '.flac']:
                             # ЛЕНИВАЯ ЗАГРУЗКА: Не парсим аудио сейчас. Просто сохраняем маркер с путем.
@@ -3642,6 +3684,11 @@ class App(ctk.CTk):
 
                         # 4. ФИНАЛЬНАЯ ВАЛИДАЦИЯ И СОХРАНЕНИЕ
                         if not text_content or not isinstance(text_content, str) or not text_content.strip():
+                            continue
+                            
+                        # Защита от попадания текста ошибки в контекст нейросети
+                        if text_content.startswith("Ошибка"):
+                            print(f"⚠️ [Вложения] Пропущен файл {os.path.basename(file_path)}. Причина: {text_content}")
                             continue
 
                         base_name = os.path.basename(file_path)
