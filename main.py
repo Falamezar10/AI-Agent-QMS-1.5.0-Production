@@ -2869,9 +2869,18 @@ class App(ctk.CTk):
 
         self.btn_history = ctk.CTkButton(self.sidebar_frame, text="📚 История диалогов", command=self.open_history_window)
         self.btn_history.grid(row=3, column=0, padx=20, pady=10)
+
+        self.export_btn = ctk.CTkButton(
+            self.sidebar_frame,
+            text="💾 Экспорт в Word", 
+            command=self.export_chat_to_word,
+            fg_color="#2E7D32",
+            hover_color="#1B5E20"
+        )
+        self.export_btn.grid(row=4, column=0, padx=20, pady=10)
         
         self.sync_button = ctk.CTkButton(self.sidebar_frame, text="Синхронизировать базу", command=self.manual_sync)
-        self.sync_button.grid(row=4, column=0, padx=20, pady=(10, 0), sticky="s")
+        self.sync_button.grid(row=5, column=0, padx=20, pady=(10, 0), sticky="s")
         self.btn_sync = self.sync_button
 
         self.auth_btn = ctk.CTkButton(
@@ -2881,7 +2890,7 @@ class App(ctk.CTk):
             fg_color="#455A64",
             hover_color="#263238"
         )
-        self.auth_btn.grid(row=5, column=0, padx=20, pady=(8, 0), sticky="s")
+        self.auth_btn.grid(row=6, column=0, padx=20, pady=(8, 0), sticky="s")
         
         # --- Тумблер автономного чтения ---
         def toggle_auto_read():
@@ -2895,7 +2904,7 @@ class App(ctk.CTk):
             font=ctk.CTkFont(size=11),
             command=toggle_auto_read
         )
-        self.auto_read_switch.grid(row=6, column=0, padx=20, pady=(15, 0), sticky="s")
+        self.auto_read_switch.grid(row=7, column=0, padx=20, pady=(15, 0), sticky="s")
         # ----------------------------------------
 
         # --- Тумблер глубокого аудита (Рефлексия) ---
@@ -2909,7 +2918,7 @@ class App(ctk.CTk):
             font=ctk.CTkFont(size=11),
             command=toggle_deep_audit
         )
-        self.deep_audit_switch.grid(row=7, column=0, padx=20, pady=(8, 0), sticky="s")
+        self.deep_audit_switch.grid(row=8, column=0, padx=20, pady=(8, 0), sticky="s")
         if self.current_settings.get("deep_audit_enabled", False):
             self.deep_audit_switch.select()
         else:
@@ -2924,14 +2933,14 @@ class App(ctk.CTk):
         self.update_ui_for_role()
 
         self.progress_bar = ctk.CTkProgressBar(self.sidebar_frame)
-        self.progress_bar.grid(row=8, column=0, padx=20, pady=(15, 4), sticky="ew")
+        self.progress_bar.grid(row=9, column=0, padx=20, pady=(15, 4), sticky="ew")
         self.progress_bar.set(0)
 
         self.file_progress_label = ctk.CTkLabel(self.sidebar_frame, text="Ожидание синхронизации", font=ctk.CTkFont(size=11))
-        self.file_progress_label.grid(row=9, column=0, padx=20, pady=(0, 6), sticky="w")
+        self.file_progress_label.grid(row=10, column=0, padx=20, pady=(0, 6), sticky="w")
         
         self.status_label = ctk.CTkLabel(self.sidebar_frame, text="Загрузка...", font=ctk.CTkFont(size=12))
-        self.status_label.grid(row=10, column=0, padx=20, pady=(5, 15))
+        self.status_label.grid(row=11, column=0, padx=20, pady=(5, 15))
         
         self.chat_frame = ctk.CTkFrame(self)
         self.chat_frame.grid(row=0, column=1, padx=10, pady=10, sticky="nsew")
@@ -2975,9 +2984,16 @@ class App(ctk.CTk):
         self.input_frame.grid(row=1, column=0, padx=10, pady=(5, 10), sticky="ew")
         self.input_frame.grid_columnconfigure(0, weight=1)
         
+        # Панель прикрепленных файлов (над полем ввода)
+        self.attached_files_frame = ctk.CTkScrollableFrame(self.input_frame, height=40, orientation="horizontal", fg_color="transparent")
+        # Изначально скрыта — отображается только при наличии вложений
+        
+        self.input_frame.grid_rowconfigure(0, weight=0)
+        self.input_frame.grid_rowconfigure(1, weight=1)
+        
         # Многострочное текстовое поле (высота 80px - это примерно 3-4 строки)
         self.input_entry = ctk.CTkTextbox(self.input_frame, font=ctk.CTkFont(size=14), height=80, wrap="word")
-        self.input_entry.grid(row=0, column=0, padx=(0, 10), pady=10, sticky="ew")
+        self.input_entry.grid(row=1, column=0, padx=(0, 10), pady=10, sticky="ew")
 
         # Обработка Enter (Отправка) и Shift+Enter (Перенос строки)
         def enter_pressed(event):
@@ -2991,7 +3007,7 @@ class App(ctk.CTk):
         self.input_entry.bind("<Return>", enter_pressed)
         
         self.send_button = ctk.CTkButton(self.input_frame, text="Отправить", width=100, command=self.send_message)
-        self.send_button.grid(row=0, column=1, padx=(0, 0), pady=10)
+        self.send_button.grid(row=1, column=1, padx=(0, 0), pady=10)
 
         # Кнопка микрофона (Push-to-Talk) — только для админа
         self.record_btn = ctk.CTkButton(
@@ -3000,9 +3016,14 @@ class App(ctk.CTk):
             width=40,
             fg_color=["#3a7ebf", "#1f538d"]
         )
-        self.record_btn.grid(row=0, column=2, padx=(5, 0), pady=10)
+        self.record_btn.grid(row=1, column=2, padx=(5, 0), pady=10)
         self.record_btn.bind('<ButtonPress-1>', self._on_record_start)
         self.record_btn.bind('<ButtonRelease-1>', self._on_record_stop)
+        
+        # Кнопка прикрепления файлов (скрепка)
+        self.attach_button = ctk.CTkButton(self.input_frame, text="📎", width=40, command=self.handle_attach_file, font=ctk.CTkFont(size=18))
+        self.attach_button.grid(row=1, column=3, padx=(5, 0), pady=10)
+        
         # Скрываем кнопку если не админ
         if getattr(self, "current_role", "guest") != "admin":
             self.record_btn.grid_remove()
@@ -3011,6 +3032,7 @@ class App(ctk.CTk):
         self.apply_audio_hotkey()
 
         self.chat_history = []
+        self.chat_attachments_dict = {}  # Формат: {"Имя_файла.pdf": "Текст..."}
         self.load_history()
         
         def init_db_thread():
@@ -3468,6 +3490,207 @@ class App(ctk.CTk):
                     self.append_to_chat(f"\n⚠️ [Система: Файл '{filename}' не найден в кэше. Возможно, он был удален.]\n", "system")
                 break
 
+    def handle_attach_file(self):
+        """Обработчик кнопки прикрепления файлов к чату."""
+        role = getattr(self, "current_role", "guest")
+        
+        if role == "admin":
+            filetypes = [
+                ("Все поддерживаемые форматы", "*.txt *.md *.docx *.doc *.rtf *.pdf *.xlsx *.csv *.jpg *.jpeg *.png *.bmp *.graphml *.html *.mp3 *.wav *.m4a *.ogg *.flac"),
+                ("Все файлы", "*.*")
+            ]
+        else:
+            filetypes = [
+                ("Документы, таблицы и схемы", "*.txt *.md *.docx *.doc *.rtf *.pdf *.xlsx *.csv *.graphml *.html")
+            ]
+
+        file_paths = filedialog.askopenfilenames(title="Прикрепить файлы", filetypes=filetypes)
+        if not file_paths:
+            return
+
+        self.attach_button.configure(text="⏳", state="disabled")
+        
+        def load_files_bg():
+            # 1. ВСЕ ИМПОРТЫ СТРОГО В НАЧАЛЕ ФУНКЦИИ (Защита от UnboundLocalError)
+            import pythoncom
+            import sys
+            import os
+            import urllib.parse
+            import time
+            import uuid
+            import win32com.client
+            
+            pythoncom.CoInitialize() # Инициализация COM-потока
+            
+            try:
+                # 2. ОПРЕДЕЛЕНИЕ ПУТЕЙ ОДИН РАЗ НА ВЕСЬ ПОТОК (Server & Exe Safe)
+                if getattr(sys, 'frozen', False):
+                    base_dir = os.path.dirname(sys.executable)
+                else:
+                    base_dir = os.path.dirname(os.path.abspath(__file__))
+                
+                cache_dir = os.path.join(base_dir, ".cache")
+                os.makedirs(cache_dir, exist_ok=True)
+                
+                # 3. ГЛАВНЫЙ ЦИКЛ ОБРАБОТКИ
+                for file_path in file_paths:
+                    try:
+                        ext = os.path.splitext(file_path)[1].lower()
+                        text_content = ""
+                        
+                        # --- СНИМОК ДО ПАРСИНГА И БАЗОВОЕ ИМЯ ---
+                        cache_snapshot_before = set(os.listdir(cache_dir)) if os.path.exists(cache_dir) else set()
+                        original_base_name = os.path.splitext(os.path.basename(file_path))[0]
+                        
+                        if ext in ['.txt', '.md', '.csv']:
+                            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                text_content = f.read()
+                                
+                        elif ext == '.graphml':
+                            text_content = extract_text_from_graphml(file_path)
+                            
+                        elif ext == '.html':
+                            text_content = extract_text_from_html_diagram(file_path)
+                            
+                        elif ext == '.docx':
+                            parsed_raw = read_docx_with_indices(file_path)
+                            # Защита от Tuple
+                            text_content = parsed_raw[0] if isinstance(parsed_raw, tuple) else parsed_raw
+                            
+                        elif ext in ['.xlsx', '.xls']:
+                            text_content = extract_text_from_excel_for_rag(file_path)
+                            
+                        elif ext == '.pdf':
+                            if role == "admin":
+                                # Продвинутый парсер PDF (с картинками и Vision OCR) для admin-роли
+                                text_content = extract_smart_vision_and_pdf(file_path)
+                            else:
+                                text_content = extract_text_from_pdf(file_path)
+                                
+                        elif role == "admin" and ext in ['.jpg', '.jpeg', '.png', '.bmp']:
+                            # Vision API для изображений (через умный Vision-роутер)
+                            text_content = extract_smart_vision_and_pdf(file_path)
+                            
+                        elif ext in ['.doc', '.rtf']:
+                            original_name = os.path.splitext(os.path.basename(file_path))[0]
+                            # Добавляем короткий хэш, чтобы файлы с одинаковым именем из разных папок не конфликтовали при одновременной загрузке
+                            temp_filename = f"converted_{original_name}_{uuid.uuid4().hex[:6]}.docx"
+                            
+                            raw_output_docx = os.path.join(cache_dir, temp_filename)
+                            output_docx = os.path.normpath(os.path.abspath(raw_output_docx))
+                            clean_file_path = os.path.normpath(os.path.abspath(urllib.parse.unquote(file_path)))
+                            
+                            word = win32com.client.DispatchEx("Word.Application")
+                            word.Visible = False
+                            
+                            com_text = ""
+                            try:
+                                doc = word.Documents.Open(clean_file_path)
+                                com_text = doc.Content.Text.replace('\r', '\n')
+                                doc.SaveAs(output_docx, 16)
+                                doc.Close(False)
+                            finally:
+                                word.Quit()
+                                doc = None
+                                word = None
+                            
+                            time.sleep(0.5) # Пауза для снятия блокировок ОС
+                            
+                            parsed_text = ""
+                            try:
+                                parsed_raw = read_docx_with_indices(output_docx)
+                                parsed_text = parsed_raw[0] if isinstance(parsed_raw, tuple) else parsed_raw
+                            except Exception as parser_e:
+                                print(f"Локальный парсер не прочитал файл, используем COM текст. Ошибка: {parser_e}")
+                                
+                            if parsed_text and isinstance(parsed_text, str) and parsed_text.strip():
+                                text_content = parsed_text
+                            else:
+                                text_content = com_text
+
+                            # Удаление временного файла
+                            try:
+                                if os.path.exists(output_docx):
+                                    os.remove(output_docx)
+                            except Exception as cleanup_e:
+                                print(f"Не удалось удалить кэш-файл {output_docx}: {cleanup_e}")
+                                
+                        elif role == "admin" and ext in ['.mp3', '.wav', '.m4a', '.ogg', '.flac']:
+                            # ЛЕНИВАЯ ЗАГРУЗКА: Не парсим аудио сейчас. Просто сохраняем маркер с путем.
+                            clean_file_path = os.path.abspath(file_path)
+                            text_content = f"[AUDIO_PENDING_PATH]: {clean_file_path}"
+
+                        else:
+                            print(f"Формат {ext} не поддерживается для роли {role}.")
+                            continue
+
+                        # --- СРАВНЕНИЕ И СНАЙПЕРСКОЕ УДАЛЕНИЕ ---
+                        if os.path.exists(cache_dir):
+                            cache_snapshot_after = set(os.listdir(cache_dir))
+                            side_effect_files = cache_snapshot_after - cache_snapshot_before
+                            
+                            for side_effect_file in side_effect_files:
+                                # СНАЙПЕРСКИЙ ФИЛЬТР: Удаляем только если имя оригинального файла есть в названии мусорного,
+                                # либо если это наш собственный сгенерированный converted_ файл для Word.
+                                if original_base_name in side_effect_file or "converted_" in side_effect_file:
+                                    file_to_remove = os.path.join(cache_dir, side_effect_file)
+                                    try:
+                                        if os.path.isfile(file_to_remove):
+                                            os.remove(file_to_remove)
+                                    except Exception as cleanup_e:
+                                        print(f"Не удалось удалить побочный файл {side_effect_file}: {cleanup_e}")
+
+                        # 4. ФИНАЛЬНАЯ ВАЛИДАЦИЯ И СОХРАНЕНИЕ
+                        if not text_content or not isinstance(text_content, str) or not text_content.strip():
+                            continue
+
+                        base_name = os.path.basename(file_path)
+                        name, e = os.path.splitext(base_name)
+                        final_name = base_name
+                        counter = 1
+                        while final_name in getattr(self, "chat_attachments_dict", {}):
+                            final_name = f"{name} ({counter}){e}"
+                            counter += 1
+                        
+                        self.chat_attachments_dict[final_name] = text_content
+                        
+                    except Exception as e:
+                        print(f"Ошибка чтения {file_path}: {e}")
+            finally:
+                pythoncom.CoUninitialize() # Очистка COM-потока
+                self.after(0, self.refresh_attached_files_ui) # Обновление интерфейса
+
+        # Запуск фонового потока
+        threading.Thread(target=load_files_bg, daemon=True).start()
+
+    def refresh_attached_files_ui(self):
+        """Обновляет панель прикрепленных файлов над полем ввода."""
+        self.attach_button.configure(text="📎", state="normal")
+        for widget in self.attached_files_frame.winfo_children():
+            widget.destroy()
+        
+        if not getattr(self, "chat_attachments_dict", {}):
+            self.attached_files_frame.grid_forget()
+            return
+        
+        self.attached_files_frame.grid(row=0, column=0, columnspan=4, padx=(0, 10), pady=(5, 0), sticky="ew")
+        
+        for filename in self.chat_attachments_dict.keys():
+            chip = ctk.CTkFrame(self.attached_files_frame, corner_radius=15, fg_color="#333333")
+            chip.pack(side="left", padx=5)
+            lbl = ctk.CTkLabel(chip, text=f"📄 {filename}", font=ctk.CTkFont(size=12), text_color="white")
+            lbl.pack(side="left", padx=(10, 5), pady=2)
+            btn_close = ctk.CTkButton(chip, text="✖", width=20, height=20, fg_color="transparent", hover_color="#555555", text_color="white",
+                                       command=lambda f=filename: self.remove_chat_attachment(f))
+            btn_close.pack(side="left", padx=(0, 5), pady=2)
+
+    def remove_chat_attachment(self, filename):
+        """Удаляет файл из вложений чата."""
+        if filename in getattr(self, "chat_attachments_dict", {}):
+            del self.chat_attachments_dict[filename]
+            self.refresh_attached_files_ui()
+            self.save_current_session()
+
     def generate_unicode_table(self, raw_table, max_chars=100):
         lines = raw_table.strip().split('\n')
         parsed_rows = []
@@ -3700,7 +3923,7 @@ class App(ctk.CTk):
                 messages=[
                     {
                         "role": "system",
-                        "content": "Сформируй краткий заголовок сессии чата на 4-5 слов. Ответь только заголовком без кавычек и пояснений."
+                        "content": "Сформируй краткий заголовок сессии чата на 4-5 слов. Максимум 3-5 слов. Ответь только заголовком без кавычек и пояснений."
                     },
                     {
                         "role": "user",
@@ -3710,6 +3933,9 @@ class App(ctk.CTk):
             )
             title = (response.choices[0].message.content or "").strip()
             title = re.sub(r'[\\/*?:"<>|]', "", title)
+            # Жесткий лимит символов
+            if len(title) > 35:
+                title = title[:35] + "..."
             if title:
                 self.session_title = title
                 self.save_current_session()
@@ -3735,7 +3961,8 @@ class App(ctk.CTk):
                 "timestamp": datetime.now().isoformat(),
                 "chat_history": self.chat_history,
                 "display_text": display_text,
-                "message_counter": self.message_counter
+                "message_counter": self.message_counter,
+                "chat_attachments_dict": getattr(self, "chat_attachments_dict", {})
             }
             with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -3754,6 +3981,9 @@ class App(ctk.CTk):
             self.message_counter = data.get("message_counter", 0)
             display_text = data.get("display_text", "")
 
+            self.chat_attachments_dict = data.get("chat_attachments_dict", {})
+            self.after(0, self.refresh_attached_files_ui)
+
             self.chat_textbox.configure(state="normal")
             self.chat_textbox.delete("1.0", "end")
             self.chat_textbox.insert("1.0", display_text)
@@ -3768,6 +3998,39 @@ class App(ctk.CTk):
             self.highlight_attachments()
         except Exception as e:
             self.append_to_chat(f"\n[Система: Ошибка загрузки сессии: {e}]\n")
+
+    def rename_chat_session(self, file_path, session_id, current_title):
+        dialog = ctk.CTkInputDialog(text="Введите новое название чата (макс. 35 символов):", title="Переименовать чат")
+        new_title = dialog.get_input()
+        
+        if new_title and new_title.strip():
+            clean_title = new_title.strip()
+            # Применяем жесткий лимит
+            if len(clean_title) > 35:
+                clean_title = clean_title[:35] + "..."
+                
+            try:
+                if os.path.exists(file_path):
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    data['title'] = clean_title
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                        
+                    # Если текущая открытая сессия совпадает - обновить заголовок
+                    if self.current_session_id == session_id:
+                        self.session_title = clean_title
+                        if hasattr(self, "chat_title_label"):
+                            self.chat_title_label.configure(text=clean_title)
+                            
+                    # Закрыть и переоткрыть окно истории для обновления
+                    for widget in self.winfo_children():
+                        if isinstance(widget, ctk.CTkToplevel) and widget.title() == "История диалогов":
+                            widget.destroy()
+                    self.after(100, self.open_history_window)
+                    
+            except Exception as e:
+                self.append_to_chat(f"\n[Система: Ошибка переименования чата: {e}]\n")
 
     def open_history_window(self):
         history_window = ctk.CTkToplevel(self)
@@ -3823,6 +4086,10 @@ class App(ctk.CTk):
             sid = data.get("session_id")
             title = data.get("title", "Новый диалог")
             timestamp = data.get("timestamp", "")
+            
+            # Применяем лимит также при отображении
+            if len(title) > 35:
+                title = title[:35] + "..."
 
             row_frame = ctk.CTkFrame(scrollable)
             row_frame.pack(fill="x", padx=4, pady=4)
@@ -3840,6 +4107,15 @@ class App(ctk.CTk):
                 width=90,
                 command=lambda session_id=sid: self.load_session(session_id, history_window)
             ).pack(side="right", padx=(6, 8), pady=8)
+
+            ctk.CTkButton(
+                row_frame,
+                text="✏️",
+                width=40,
+                fg_color="#444444",
+                hover_color="#333333",
+                command=lambda fp=file_path, session_id=sid, ctitle=title: self.rename_chat_session(fp, session_id, ctitle)
+            ).pack(side="right", padx=(0, 4), pady=8)
 
             ctk.CTkButton(
                 row_frame,
@@ -3893,6 +4169,8 @@ class App(ctk.CTk):
         self.chat_textbox.delete("1.0", "end")
         self.chat_textbox.configure(state="disabled")
         self.chat_history = []
+        self.chat_attachments_dict = {}
+        self.after(0, self.refresh_attached_files_ui)
         self.message_counter = 0  # Сброс счетчика сообщений
         self.current_session_id = str(uuid.uuid4())
         self.session_title = "Новый диалог"
@@ -3907,6 +4185,160 @@ class App(ctk.CTk):
             self.append_to_chat("\n[СИСТЕМА: Ваш личный архив диалога очищен]\n\n")
         except:
             pass # Если коллекции еще нет, игнорируем
+
+    def export_chat_to_word(self):
+        import re
+        import os
+        from tkinter import filedialog
+        from docx import Document
+        from docx.shared import Pt, RGBColor
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        
+        if not getattr(self, "chat_history", []):
+            print("История чата пуста. Нечего экспортировать.")
+            return
+
+        # 1. Запрос пути для сохранения
+        default_name = "Диалог_с_Агентом.docx"
+        if getattr(self, "current_session_id", None) and hasattr(self, "chat_sessions"):
+            session_title = self.chat_sessions.get(self.current_session_id, {}).get("title", "")
+            if session_title:
+                # Очистка имени файла от запрещенных символов
+                safe_title = re.sub(r'[\\/*?:"<>|]', "", session_title)
+                default_name = f"{safe_title[:30]}.docx"
+
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".docx",
+            initialfile=default_name,
+            title="Сохранить чат как...",
+            filetypes=[("Word Document", "*.docx")]
+        )
+        
+        if not file_path:
+            return # Пользователь отменил сохранение
+
+        try:
+            doc = Document()
+            
+            # Заголовок документа
+            title = doc.add_heading('Протокол диалога с ИИ-Агентом', 0)
+            title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            
+            # 2. Фильтрация и парсинг истории
+            for message in self.chat_history:
+                role = message.get("role")
+                content = message.get("content", "")
+                
+                if role not in ["user", "assistant"] or not content.strip():
+                    continue
+                
+                # Имя отправителя
+                sender_name = "👤 Вы:" if role == "user" else "🤖 ИИ-Агент:"
+                p_sender = doc.add_paragraph()
+                run_sender = p_sender.add_run(sender_name)
+                run_sender.bold = True
+                run_sender.font.color.rgb = RGBColor(0, 102, 204) if role == "user" else RGBColor(0, 153, 76)
+                
+                # ОЧИСТКА ОТ ШУМА АГЕНТА (БЕЗ глобальной замены <br>)
+                clean_lines = []
+                for line in content.split('\n'):
+                    # Пропускаем строки с вызовом инструментов
+                    if "⚙️ [Действие:" in line or "Обдумываю шаг" in line:
+                        continue
+                    clean_lines.append(line)
+                
+                # 3. Микро-парсер Markdown (Текст и Таблицы)
+                in_table = False
+                table_data = []
+                
+                def flush_table():
+                    if table_data and len(table_data) > 1:
+                        # Создаем таблицу
+                        cols = len(table_data[0])
+                        table = doc.add_table(rows=1, cols=cols)
+                        table.style = 'Table Grid'
+                        
+                        # Заголовки
+                        hdr_cells = table.rows[0].cells
+                        for i, cell_text in enumerate(table_data[0]):
+                            if i < cols:
+                                # ЛОКАЛЬНАЯ ОЧИСТКА: Меняем <br> на \n и убираем **
+                                cleaned_cell = re.sub(r'<br\s*/?>', '\n', cell_text, flags=re.IGNORECASE)
+                                hdr_cells[i].text = cleaned_cell.replace('**', '').strip()
+                                # Сделаем заголовки жирными
+                                for paragraph in hdr_cells[i].paragraphs:
+                                    for run in paragraph.runs:
+                                        run.bold = True
+                        
+                        # Строки данных (пропускаем индекс 1, если это разделитель |---|---|)
+                        start_idx = 1
+                        if len(table_data) > 1 and all(set(c.strip()) <= {'-', ':', ''} for c in table_data[1]):
+                            start_idx = 2
+                            
+                        for row_idx in range(start_idx, len(table_data)):
+                            row_cells = table.add_row().cells
+                            for i, cell_text in enumerate(table_data[row_idx]):
+                                if i < cols:
+                                    # ЛОКАЛЬНАЯ ОЧИСТКА: Меняем <br> на \n и убираем **
+                                    cleaned_cell = re.sub(r'<br\s*/?>', '\n', cell_text, flags=re.IGNORECASE)
+                                    row_cells[i].text = cleaned_cell.replace('**', '').strip()
+                    table_data.clear()
+
+                for line in clean_lines:
+                    line_stripped = line.strip()
+                    
+                    # Проверка на таблицу (начинается и заканчивается на |)
+                    if line_stripped.startswith('|') and line_stripped.endswith('|'):
+                        in_table = True
+                        # Разбиваем строку по |, игнорируя первый и последний пустые элементы
+                        row = [cell for cell in line_stripped.split('|')][1:-1]
+                        table_data.append(row)
+                    else:
+                        if in_table:
+                            flush_table()
+                            in_table = False
+                        
+                        if not line_stripped:
+                            continue
+                            
+                        # Проверка на заголовки
+                        header_match = re.match(r'^(#{1,6})\s+(.*)', line_stripped)
+                        if header_match:
+                            level = len(header_match.group(1))
+                            # ОЧИСТКА: В заголовках <br> превращаем в пробел
+                            text = header_match.group(2).replace('**', '')
+                            text = re.sub(r'<br\s*/?>', ' ', text, flags=re.IGNORECASE)
+                            doc.add_heading(text.strip(), level=min(level, 9))
+                        else:
+                            # Обычный абзац
+                            p = doc.add_paragraph()
+                            # ЛОКАЛЬНАЯ ОЧИСТКА: Меняем <br> на \n
+                            line_clean = re.sub(r'<br\s*/?>', '\n', line_stripped, flags=re.IGNORECASE)
+                            # Разбиваем строку по маркерам жирного текста
+                            parts = re.split(r'(\*\*.*?\*\*)', line_clean)
+                            for part in parts:
+                                if part.startswith('**') and part.endswith('**'):
+                                    run = p.add_run(part[2:-2])
+                                    run.bold = True
+                                else:
+                                    p.add_run(part)
+
+                # Если сообщение закончилось таблицей
+                if in_table:
+                    flush_table()
+                
+                # Отступ между сообщениями
+                doc.add_paragraph()
+
+            # Сохранение файла
+            doc.save(file_path)
+            
+            # Уведомление в чат
+            self.append_to_chat(f"\n[💾 Система: Диалог успешно экспортирован в Word по пути:\n{file_path}]\n\n", "system")
+            
+        except Exception as e:
+            print(f"Ошибка экспорта в Word: {e}")
+            self.append_to_chat(f"\n[⚠️ Система: Ошибка при экспорте диалога в Word: {e}]\n\n", "system")
 
     def manual_sync(self):
         self.status_label.configure(text="Синхронизация...")
@@ -4615,6 +5047,20 @@ class App(ctk.CTk):
                         "required": ["title", "nodes", "edges"]
                     }
                 }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_attached_file",
+                    "description": "Читает содержимое файла, прикрепленного пользователем к текущему чату. Используй это, когда пользователь просит проанализировать или саммаризировать загруженный документ.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "filename": {"type": "string", "description": "Имя прикрепленного файла (точно как указано в системном промпте)."}
+                        },
+                        "required": ["filename"]
+                    }
+                }
             }
         ]
 
@@ -4786,6 +5232,78 @@ class App(ctk.CTk):
             return draft_email_tool(args.get("to_name"), args.get("subject"), args.get("html_body"))
         elif func_name == "draft_meeting":
             return draft_meeting_tool(args.get("to_name"), args.get("subject"), args.get("body"), args.get("duration_minutes", 60))
+        elif func_name == "read_attached_file":
+            filename = args.get("filename", "")
+            if filename in getattr(self, "chat_attachments_dict", {}):
+                content = self.chat_attachments_dict[filename]
+                
+                # Проверяем, является ли это аудиофайлом, ожидающим транскрибации
+                if isinstance(content, str) and content.startswith("[AUDIO_PENDING_PATH]:"):
+                    import os
+                    import sys
+                    
+                    audio_path = content.replace("[AUDIO_PENDING_PATH]:", "").strip()
+                    original_base_name = os.path.splitext(os.path.basename(audio_path))[0]
+                    audio_dir = os.path.dirname(audio_path)
+                    
+                    # 1. Системное сообщение о начале
+                    self.append_to_chat(f"\n[🎙️ Система: Запущен процесс транскрибации аудиофайла '{filename}'. Пожалуйста, подождите...]\n\n", "system")
+                    
+                    # 2. Определяем папку кэша для Сборщика мусора
+                    if getattr(sys, 'frozen', False):
+                        base_dir = os.path.dirname(sys.executable)
+                    else:
+                        base_dir = os.path.dirname(os.path.abspath(__file__))
+                    cache_dir = os.path.join(base_dir, ".cache")
+                    
+                    cache_snapshot_before = set(os.listdir(cache_dir)) if os.path.exists(cache_dir) else set()
+                    
+                    # 3. ТРАНСКРИБАЦИЯ
+                    parser_result = ""
+                    try:
+                        parser_result = transcribe_audio_logic(audio_path, self)
+                    except Exception as e:
+                        return f"Ошибка при транскрибации аудио: {e}"
+                    
+                    # 4. УБОРЩИК МУСОРА: Удаляем .md расшифровки из .cache
+                    if os.path.exists(cache_dir):
+                        cache_snapshot_after = set(os.listdir(cache_dir))
+                        for side_effect_file in (cache_snapshot_after - cache_snapshot_before):
+                            if original_base_name in side_effect_file:
+                                try:
+                                    os.remove(os.path.join(cache_dir, side_effect_file))
+                                except:
+                                    pass
+                    
+                    # 5. ИЗВЛЕЧЕНИЕ ЧИСТОГО ТЕКСТА ДЛЯ ПАМЯТИ АГЕНТА
+                    transcribed_text = ""
+                    
+                    # Вариант А: Парсер сохранил .docx рядом с аудиофайлом. Ищем его и читаем.
+                    try:
+                        for file in os.listdir(audio_dir):
+                            if file.endswith(".docx") and original_base_name in file:
+                                docx_file_path = os.path.join(audio_dir, file)
+                                parsed_raw = read_docx_with_indices(docx_file_path)
+                                transcribed_text = parsed_raw[0] if isinstance(parsed_raw, tuple) else parsed_raw
+                                break
+                    except Exception as read_e:
+                        print(f"Не удалось найти/прочитать сгенерированный docx: {read_e}")
+                    
+                    # Вариант Б: Если файл .docx не найден, берем ответ парсера как текст (если он длинный)
+                    if not transcribed_text and parser_result and len(str(parser_result)) > 50:
+                        transcribed_text = str(parser_result)
+                        
+                    # 6. КЭШИРОВАНИЕ В ПАМЯТИ: Заменяем маркер на готовый текст
+                    if transcribed_text and transcribed_text.strip():
+                        self.chat_attachments_dict[filename] = transcribed_text
+                        content = transcribed_text
+                        self.append_to_chat(f"\n[✅ Система: Транскрипция завершена. Документ сохранен рядом с исходным файлом. Текст загружен в память Агента.]\n\n", "system")
+                    else:
+                        content = f"Ошибка: Транскрибация прошла, но не удалось извлечь текст для памяти. Ответ парсера: {parser_result}"
+                        self.chat_attachments_dict[filename] = content
+                        
+                return content
+            return f"Ошибка: Файл '{filename}' не найден во вложениях."
         else: return f"Ошибка: Инструмент не найден."
 
     # ==================== АГЕНТНЫЙ ЦИКЛ ====================
@@ -4865,6 +5383,11 @@ class App(ctk.CTk):
                 "3. ДОЖДАТЬСЯ ответа пользователя ('Да', 'Разрешаю' и т.д.) и только после этого вызывать 'read_local_file'."
             )
         # -----------------------------------
+        
+        # Инъекция информации о прикрепленных файлах в системный промпт
+        if getattr(self, "chat_attachments_dict", {}):
+            attached_files_list = ", ".join(self.chat_attachments_dict.keys())
+            system_prompt += f"\n\n[ВАЖНО] Пользователь прикрепил к этому чату следующие файлы: {attached_files_list}. Чтобы узнать их содержимое, вызови инструмент `read_attached_file`."
         
         messages_for_llm = [{"role": "system", "content": system_prompt}] + self._build_injected_messages()
         
@@ -5067,7 +5590,11 @@ class App(ctk.CTk):
                     })
                      
             except Exception as e:
-                self.append_to_chat(f"\n[Критическая ошибка Агента: {str(e)}]\n\n")
+                error_str = str(e).lower()
+                if "context_length_exceeded" in error_str or "maximum context length" in error_str or "400" in error_str:
+                    self.append_to_chat("\n[⚠️ Ошибка: Объем прикрепленных файлов превышает лимит памяти нейросети. Пожалуйста, удалите часть файлов или разбейте документ на части.]\n\n")
+                else:
+                    self.append_to_chat(f"\n[Критическая ошибка Агента: {str(e)}]\n\n")
                 self.save_current_session()
                 break
         else:
