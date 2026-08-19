@@ -3,6 +3,7 @@ __pycache__/
 .cache/
 smk_vector_db/
 local_vector_db/
+.smk_chroma_db/
 Memory/
 file_states.json
 chat_history.json

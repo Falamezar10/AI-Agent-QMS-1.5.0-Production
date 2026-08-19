@@ -7,7 +7,12 @@ echo.
 
 REM Получаем путь к текущей сетевой папке
 set "SERVER_PATH=%~dp0"
-set "LOCAL_DIR=%LOCALAPPDATA%\SMK_Agent_Client"
+
+:: Определяем сетевой путь и имя папки базы
+set "SERVER_DIR=%SERVER_PATH:~0,-1%"
+for %%I in ("%SERVER_DIR%") do set "AGENT_NAME=%%~nxI"
+
+set "LOCAL_DIR=%LOCALAPPDATA%\SMK_Agent_Client_%AGENT_NAME%"
 
 echo [1] Синхронизируем файлы программы с сервером...
 echo Запущено скоростное многопоточное копирование. Пожалуйста, подождите...
@@ -31,10 +36,10 @@ if exist "%SERVER_PATH%*.ico" copy /Y "%SERVER_PATH%*.ico" "%LOCAL_DIR%\" >nul
 
 echo.
 echo [2] Создаем умный ярлык на вашем Рабочем столе...
-set "SHORTCUT=%USERPROFILE%\Desktop\ИИ-Агент СМК.lnk"
+set "SHORTCUT_NAME=ИИ-Агент СМК (%AGENT_NAME%).lnk"
+set "SHORTCUT=%USERPROFILE%\Desktop\%SHORTCUT_NAME%"
 set "TARGET=%LOCAL_DIR%\SMK_Agent.exe"
-set "CLEAN_SERVER=%SERVER_PATH:~0,-1%"
-set "ARGS=--server ""%CLEAN_SERVER%"""
+set "ARGS=--server ""%SERVER_DIR%"""
 
 REM Магия PowerShell для ярлыка
 REM Теперь мы явно указываем ярлыку брать иконку прямо из самого SMK_Agent.exe ($s.IconLocation = '%TARGET%, 0')
@@ -43,6 +48,7 @@ powershell -nologo -noprofile -Command "$wshell = New-Object -ComObject WScript.
 echo.
 echo =======================================================
 echo ГОТОВО! Процесс завершен.
-echo На вашем Рабочем столе находится актуальный "ИИ-Агент СМК".
+echo На вашем Рабочем столе находится актуальный "%SHORTCUT_NAME%".
+echo Аргент подключен к базе: %AGENT_NAME%
 echo =======================================================
 pause
